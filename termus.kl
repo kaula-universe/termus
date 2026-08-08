@@ -1,0 +1,170 @@
+import std.io
+import std.string
+
+type CBPlay = void(int)void
+
+type CBVoid = void()void
+
+type CBSeek = void(f64)void
+
+type CBVolume = void(int)void
+
+extern fn termus_play(idx: int)
+
+extern fn termus_toggle()
+
+extern fn termus_stop()
+
+extern fn termus_next()
+
+extern fn termus_prev()
+
+extern fn termus_cycle_mode()
+
+extern fn termus_seek(sec: f64)
+
+extern fn termus_set_volume(pct: int)
+
+extern fn termus_cycle_speed()
+
+extern fn termus_set_eq_enabled(on: int)
+
+extern fn termus_cycle_eq_preset()
+
+extern fn termus_state() -> int
+
+extern fn termus_position() -> f64
+
+extern fn termus_duration() -> f64
+
+extern fn termus_current_index() -> int
+
+extern fn termus_title() -> char*
+
+extern fn termus_mode_name() -> char*
+
+extern fn termus_volume() -> int
+
+extern fn termus_speed() -> f64
+
+extern fn termus_eq_enabled() -> int
+
+extern fn termus_eq_preset_name() -> char*
+
+extern fn termus_codec_info() -> char*
+
+extern fn termus_playlist_size() -> int
+
+extern fn termus_playlist_name(i: int) -> char*
+
+extern fn termus_playlist_path(i: int) -> char*
+
+extern fn termus_playlist_refresh(dir: char*) -> int
+
+extern fn termus_fav_toggle()
+
+extern fn termus_fav_count() -> int
+
+extern fn termus_fav_name(i: int) -> char*
+
+extern fn termus_ui_start(cb_play: CBPlay, cb_toggle: CBVoid, cb_stop: CBVoid, cb_next: CBVoid, cb_prev: CBVoid, cb_mode: CBVoid, cb_seek: CBSeek, cb_volume: CBVolume, cb_speed: CBVoid, cb_eq: CBVoid, cb_eq_preset: CBVoid, cb_refresh: CBVoid, cb_fav: CBVoid, cb_exit: CBVoid)
+
+extern fn termus_ui_exit() -> void
+
+// C 标准库
+extern fn getenv(name: const char*) -> char*
+
+fn on_play(idx: int) {
+    println("on_play: ", idx)
+    termus_play(idx)
+}
+
+fn on_toggle() {
+    println("on_toggle")
+    termus_toggle()
+}
+
+fn on_stop() {
+    println("on_stop")
+    termus_stop()
+}
+
+fn on_next() {
+    println("on_next")
+    termus_next()
+}
+
+fn on_prev() {
+    println("on_prev")
+    termus_prev()
+}
+
+fn on_mode() {
+    println("on_mode")
+    termus_cycle_mode()
+}
+
+fn on_seek(sec: f64) {
+    println("on_seek: ", sec)
+    termus_seek(sec)
+}
+
+fn on_volume(pct: int) {
+    println("on_volume: ", pct)
+    termus_set_volume(pct)
+}
+
+fn on_speed() {
+    println("on_speed")
+    termus_cycle_speed()
+}
+
+fn on_eq() {
+    println("on_eq")
+    termus_set_eq_enabled(1 - termus_eq_enabled())
+}
+
+fn on_eq_preset() {
+    println("on_eq_preset")
+    termus_cycle_eq_preset()
+}
+
+fn on_refresh() {
+    println("on_refresh")
+    int n = scan_music()
+    println("刷新: ", n, " 个文件")
+}
+
+fn on_fav() {
+    println("on_fav")
+    termus_fav_toggle()
+}
+
+fn on_exit() {
+    println("on_exit")
+    termus_ui_exit()
+}
+
+// 扫描播放目录: 优先 ~/Music, 目录不存在/为空时回退 C:/Windows/Media
+fn scan_music() int {
+    string envName = string_create("USERPROFILE")
+    char* home = getenv(envName.ptr)
+    if (home != null) {
+        string base = string_create(home)
+        string musicPath = string_concat(base, string_create("/Music"))
+        int n = termus_playlist_refresh(musicPath.ptr)
+        if (n > 0) {
+            return n
+        }
+    }
+    string fallback = string_create("C:/Windows/Media")
+    return termus_playlist_refresh(fallback.ptr)
+}
+
+fn main() {
+    println("Termus — Kaula 终端音乐播放器")
+    int n = scan_music()
+    println("播放列表: ", n, " 个文件")
+    termus_ui_start(on_play, on_toggle, on_stop, on_next, on_prev, on_mode, on_seek, on_volume, on_speed, on_eq, on_eq_preset, on_refresh, on_fav, on_exit)
+    println("再见!")
+}

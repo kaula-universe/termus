@@ -1,0 +1,29 @@
+{
+  "base_path": ".",
+  "include_path": "C:/Code/kaula/std",
+  "source_dir": ".",
+  "c_flags": [
+    "-IC:/Code/termus",
+    "-LC:/Code/termus",
+    "-LC:/Code/third_party/FFmpeg-n7.1/libavcodec",
+    "-LC:/Code/third_party/FFmpeg-n7.1/libavformat",
+    "-LC:/Code/third_party/FFmpeg-n7.1/libavutil",
+    "-LC:/Code/third_party/FFmpeg-n7.1/libavfilter",
+    "-LC:/Code/third_party/FFmpeg-n7.1/libswresample"
+  ],
+  "c_libs": [
+    "termus_bridge",
+    "c++",
+    "c++abi",
+    "avformat",
+    "avcodec",
+    "avfilter",
+    "swresample",
+    "avutil",
+    "ole32",
+    "avrt",
+    "uuid",
+    "bcrypt",
+    "winmm"
+  ]
+}

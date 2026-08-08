@@ -1,0 +1,7 @@
+# 构建产物
+build/
+cache/
+*.exe
+*.a
+*.o
+*.log
