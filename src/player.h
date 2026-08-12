@@ -62,6 +62,8 @@ public:
     State state() const;
     size_t currentIndex() const;
     bool audioOk() const { return audioOk_; }
+    // 内嵌歌词 (FFmpeg metadata "lyrics", ID3 USLT 等), 无则返回空串
+    std::string embeddedLyrics() const;
     double position() const;   // 秒
     double duration() const;   // 秒
     std::string currentTitle() const;
@@ -73,6 +75,11 @@ public:
     int bitDepth() const;
     int64_t bitRate() const;
 
+    // 频谱可视化: 返回 kSpectrumBands 个频段的电平(0.0f..1.0f)。
+    // 内部在音频回调中低频采样做 DFT(与原版 termusic visualizer 同思路)。
+    static constexpr int kSpectrumBands = 12;
+    void spectrumLevels(float* out, int count) const;
+
 private:
     void decoderLoop();
     bool openCurrent();
@@ -83,6 +90,7 @@ private:
     void wakeDecoder();
     void rebuildTempoGraph();   // 变速变化时重建 atempo 滤镜图
     void applyEq(float* data, size_t samples);  // f32 交错, 就地滤波
+    void analyzeSpectrum(const float* data, size_t samples);  // 音频回调采样做 DFT
 
     struct Biquad {
         float b0 = 1, b1 = 0, b2 = 0, a1 = 0, a2 = 0;
@@ -116,6 +124,13 @@ private:
     int sampleRateIn_ = 0;
     int bitDepth_ = 16;
     int64_t bitRate_ = 0;
+    std::string embeddedLyrics_;  // 内嵌歌词(metadata), 空串表示无
+
+    // 频谱可视化(DFT, 与 termusic visualizer 同思路)
+    static constexpr int kSpectrumAnalysis = 256;   // DFT 点数
+    std::vector<float> spectrumLevels_{};           // 平滑后的频段电平 (0..1)
+    mutable std::mutex spectrumMutex_;
+    uint64_t lastSpectrumMs_ = 0;
 
     // 环形缓冲(f32 交错)
     static constexpr size_t kRingFrames = 44100 * 4;  // 4 秒 @44.1k

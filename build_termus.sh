@@ -52,6 +52,7 @@ compile() {  # compile <src> <obj>
 compile "$HERE/termus_bridge.cpp" "$BUILD/termus_bridge.o"
 compile "$HERE/src/player.cpp"    "$BUILD/player.o"
 compile "$HERE/src/audio_out.cpp" "$BUILD/audio_out.o"
+compile "$HERE/src/cover.cpp"     "$BUILD/cover.o"
 
 # FTXUI 源码(排除测试/fuzzer)
 # 注意: dom/color.cpp 与 screen/color.cpp 等存在同名源文件,

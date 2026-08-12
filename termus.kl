@@ -147,17 +147,17 @@ fn on_exit() {
 
 // 扫描播放目录: 优先 ~/Music, 目录不存在/为空时回退 C:/Windows/Media
 fn scan_music() int {
-    string envName = string_create("USERPROFILE")
+    string envName = std.string.string_create("USERPROFILE")
     char* home = getenv(envName.ptr)
     if (home != null) {
-        string base = string_create(home)
-        string musicPath = string_concat(base, string_create("/Music"))
+        string base = std.string.string_create(home)
+        string musicPath = std.string.string_concat(base, std.string.string_create("/Music"))
         int n = termus_playlist_refresh(musicPath.ptr)
         if (n > 0) {
             return n
         }
     }
-    string fallback = string_create("C:/Windows/Media")
+    string fallback = std.string.string_create("C:/Windows/Media")
     return termus_playlist_refresh(fallback.ptr)
 }
 

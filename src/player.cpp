@@ -1,6 +1,10 @@
 // player.cpp — FFmpeg 解码 + 环形缓冲 + WASAPI 输出
 #include "player.h"
 
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 extern "C" {
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
@@ -481,6 +485,12 @@ bool Player::openCurrent() {
         bitDepth_ = av_get_bytes_per_sample(codecCtx_->sample_fmt) * 8;
         bitRate_ = codecCtx_->bit_rate > 0 ? codecCtx_->bit_rate : fmtCtx_->bit_rate;
         if (bitRate_ <= 0) bitRate_ = 0;
+        // 内嵌歌词: ID3 USLT / Vorbis lyrics 等会映射到 metadata 的 "lyrics" 键
+        embeddedLyrics_.clear();
+        AVDictionaryEntry* lyr = av_dict_get(fmtCtx_->metadata, "lyrics", nullptr, AV_DICT_IGNORE_SUFFIX);
+        if (lyr && lyr->value) {
+            embeddedLyrics_ = lyr->value;
+        }
     }
 
     swr_ = swr_alloc();
@@ -511,6 +521,13 @@ void Player::closeCurrent() {
     if (codecCtx_) { avcodec_free_context(&codecCtx_); codecCtx_ = nullptr; }
     if (fmtCtx_) { avformat_close_input(&fmtCtx_); fmtCtx_ = nullptr; }
     streamIndex_ = -1;
+    std::lock_guard<std::mutex> lock(ctlMutex_);
+    embeddedLyrics_.clear();
+}
+
+std::string Player::embeddedLyrics() const {
+    std::lock_guard<std::mutex> lock(ctlMutex_);
+    return embeddedLyrics_;
 }
 
 void Player::decoderLoop() {
@@ -737,7 +754,108 @@ UINT32 Player::fillAudio(float* dst, UINT32 maxFrames) {
         }
         readPos_ = (readPos_ + toCopy) % kRingFrames;
         bufferedFrames_ -= toCopy;
+        // 频谱采样(用输出数据, 含音量)
+        analyzeSpectrum(dst, static_cast<size_t>(toCopy) * outChannels_);
     }
     ringCv_.notify_all();
     return toCopy;
+}
+
+// analyzeSpectrum — 低频(约 50ms 一次)采样输出数据做 DFT, 得到 12 个频段电平。
+// 与原版 termusic visualizer 同思路: 汉宁窗 + 直接 DFT + 平滑。
+// 频段按对数分布覆盖 60Hz..16kHz(音乐主要能量区)。
+void Player::analyzeSpectrum(const float* data, size_t samples) {
+    uint64_t now = static_cast<uint64_t>(
+        std::chrono::steady_clock::now().time_since_epoch().count() / 1000000ULL);
+    {
+        std::lock_guard<std::mutex> lock(spectrumMutex_);
+        if (now - lastSpectrumMs_ < 50) return;
+        lastSpectrumMs_ = now;
+    }
+
+    const int N = kSpectrumAnalysis;
+    // 从最近数据尾部取 N 帧(单声道混合)
+    std::vector<float> mono(static_cast<size_t>(N), 0.0f);
+    size_t avail = samples / static_cast<size_t>(outChannels_);
+    if (avail > 0) {
+        size_t start = avail > static_cast<size_t>(N) ? avail - static_cast<size_t>(N) : 0;
+        size_t n = std::min<size_t>(avail, static_cast<size_t>(N));
+        for (size_t i = 0; i < n; ++i) {
+            float sum = 0;
+            for (int ch = 0; ch < outChannels_; ++ch) {
+                sum += data[(start + i) * static_cast<size_t>(outChannels_) + static_cast<size_t>(ch)];
+            }
+            mono[static_cast<size_t>(N) - n + i] = sum / static_cast<float>(outChannels_);
+        }
+    }
+
+    // 汉宁窗
+    static std::vector<float> window;
+    if (window.empty()) {
+        window.resize(static_cast<size_t>(N));
+        for (int i = 0; i < N; ++i) {
+            window[static_cast<size_t>(i)] = 0.5f - 0.5f * std::cos(2.0 * M_PI * i / (N - 1));
+        }
+    }
+    for (int i = 0; i < N; ++i) mono[static_cast<size_t>(i)] *= window[static_cast<size_t>(i)];
+
+    // 频段边界(对数): 60Hz..16kHz, 12 段
+    static const float kBandMin = 60.0f, kBandMax = 16000.0f;
+    static const int kNumBands = Player::kSpectrumBands;
+    std::vector<float> levels(static_cast<size_t>(kNumBands), 0.0f);
+
+    float sampleRate = static_cast<float>(outSampleRate_);
+    // 对每个 bin 做 DFT, 汇总到对应频段
+    int maxBin = N / 2;
+    for (int bin = 1; bin < maxBin; ++bin) {
+        float freq = sampleRate * static_cast<float>(bin) / static_cast<float>(N);
+        if (freq < kBandMin || freq > kBandMax) continue;
+        float real = 0, imag = 0;
+        float coeff = 2.0f * static_cast<float>(M_PI) * static_cast<float>(bin) / static_cast<float>(N);
+        for (int n = 0; n < N; ++n) {
+            float ang = coeff * static_cast<float>(n);
+            real += mono[static_cast<size_t>(n)] * std::cos(ang);
+            imag -= mono[static_cast<size_t>(n)] * std::sin(ang);
+        }
+        float mag = std::sqrt(real * real + imag * imag) / static_cast<float>(N / 2);
+        // 对数分桶
+        float logPos = (std::log(freq / kBandMin)) / (std::log(kBandMax / kBandMin));
+        int band = static_cast<int>(logPos * static_cast<float>(kNumBands));
+        if (band < 0) band = 0;
+        if (band >= kNumBands) band = kNumBands - 1;
+        levels[static_cast<size_t>(band)] += mag;
+    }
+
+    // dB 压缩 + 归一化 + 平滑
+    {
+        std::lock_guard<std::mutex> lock(spectrumMutex_);
+        if (spectrumLevels_.size() != static_cast<size_t>(kNumBands)) {
+            spectrumLevels_.assign(static_cast<size_t>(kNumBands), 0.0f);
+        }
+        for (int b = 0; b < kNumBands; ++b) {
+            float v = levels[static_cast<size_t>(b)];
+            // 20*log10 压缩, 参考 -60dB..0dB -> 0..1
+            float db = 20.0f * std::log10(v + 1e-6f);
+            float norm = (db + 60.0f) / 60.0f;
+            if (norm < 0) norm = 0;
+            if (norm > 1) norm = 1;
+            float prev = spectrumLevels_[static_cast<size_t>(b)];
+            // 攻击快、释放慢
+            float alpha = norm > prev ? 0.7f : 0.25f;
+            spectrumLevels_[static_cast<size_t>(b)] = prev + alpha * (norm - prev);
+        }
+    }
+}
+
+// spectrumLevels — 返回当前频段电平(拷贝, 供 UI 线程读取)
+void Player::spectrumLevels(float* out, int count) const {
+    std::lock_guard<std::mutex> lock(spectrumMutex_);
+    if (count <= 0) return;
+    if (spectrumLevels_.empty()) {
+        std::fill(out, out + count, 0.0f);
+        return;
+    }
+    int n = std::min(count, static_cast<int>(spectrumLevels_.size()));
+    for (int i = 0; i < n; ++i) out[i] = spectrumLevels_[static_cast<size_t>(i)];
+    for (int i = n; i < count; ++i) out[i] = 0.0f;
 }

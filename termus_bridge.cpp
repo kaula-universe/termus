@@ -9,12 +9,22 @@
 #include <ftxui/dom/elements.hpp>
 
 #include "src/player.h"
+#include "src/cover.h"
+
+// Windows wingdi.h 定义了 RGB(r,g,b) 宏, 会污染 FTXUI 的 Color::RGB 成员
+#ifdef RGB
+#undef RGB
+#endif
 
 #include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -25,9 +35,273 @@ namespace {
 
 Player g_player;
 std::vector<std::string> g_files;
+// 播放列表显示条目(随 refresh 重建; Menu 直接引用本向量, 刷新后 UI 即更新)
+std::vector<std::string> g_entries;
 std::vector<std::string> g_favorites;
+std::vector<std::string> g_history;
 std::string g_scanDir;
 bool g_hasPlaylist = false;
+
+// 设置项(持久化)
+bool g_autoPlay = false;
+bool g_showLrcPanel = true;
+int g_autoplaySel = 0;
+int g_showlrcSel = 0;
+
+// 视图: 0=主界面 1=设置
+int g_viewSel = 0;
+
+// ---- 专辑封面(切歌解码缓存 + 渲染时动态重采样, 同 C++ 版) ----
+CoverImage g_coverImg;                    // 解码缓存(重操作, 切歌时做一次)
+std::vector<CoverCell> g_coverCells;      // 当前尺寸的色块
+int g_coverGenW = 0, g_coverGenH = 0;     // 上次生成时的终端尺寸
+size_t g_coverTrackIdx = SIZE_MAX;        // 已解码的曲目
+
+// 切歌时调用: 解码封面缓存(轻量封装)
+void CoverLoadFor(size_t idx, const std::vector<std::string>& files) {
+    g_coverImg = CoverImage();
+    g_coverCells.clear();
+    g_coverGenW = g_coverGenH = 0;
+    g_coverTrackIdx = idx;
+    if (idx >= files.size()) return;
+    g_coverImg = coverDecode(files[idx]);
+}
+
+// 渲染时调用: 按终端尺寸动态生成色块(尺寸变化才重算)
+void CoverEnsureCells(int termW, int termH) {
+    int wantCols = termW * 3 / 10;                  // 封面宽 = 终端宽*3/10
+    int wantRows = std::min(wantCols / 2, termH / 2);  // 高 = 宽/2, 不超屏高 1/2
+    if (wantCols < 16) wantCols = 16;
+    if (wantRows < 8) wantRows = 8;
+    if ((wantCols != g_coverGenW || wantRows != g_coverGenH) && g_coverImg.valid()) {
+        g_coverGenW = wantCols;
+        g_coverGenH = wantRows;
+        g_coverCells = coverCellsFromRgb(g_coverImg, wantCols, wantRows);
+    }
+}
+
+// ---- 工具函数 ----
+
+std::string FormatTime(double sec) {
+    if (sec < 0) sec = 0;
+    int total = static_cast<int>(sec);
+    return std::to_string(total / 60) + ":" +
+           (total % 60 < 10 ? "0" : "") + std::to_string(total % 60);
+}
+
+std::string FormatBitrate(int64_t br) {
+    if (br >= 1000000) return std::to_string(br / 1000000) + "." +
+                               std::to_string((br % 1000000) / 100000) + "Mbps";
+    return std::to_string(br / 1000) + "kbps";
+}
+
+std::string BaseName(const std::string& path) {
+    return std::filesystem::path(path).filename().string();
+}
+
+// ---- LRC 歌词 ----
+
+struct LrcLine {
+    double time = 0.0;
+    std::string text;
+};
+
+std::vector<LrcLine> ParseLrcText(const std::string& content) {
+    std::vector<LrcLine> out;
+    std::istringstream ss(content);
+    std::string line;
+    while (std::getline(ss, line)) {
+        auto lb = line.find('[');
+        if (lb == std::string::npos) continue;
+        auto rb = line.find(']', lb);
+        if (rb == std::string::npos) continue;
+        std::string tag = line.substr(lb + 1, rb - lb - 1);
+        if (tag.empty()) continue;
+        int m = std::atoi(tag.c_str());
+        auto colon = tag.find(':');
+        int s = colon != std::string::npos ? std::atoi(tag.c_str() + colon + 1) : 0;
+        LrcLine l;
+        l.time = static_cast<double>(m) * 60.0 + static_cast<double>(s);
+        l.text = line.substr(rb + 1);
+        out.push_back(l);
+    }
+    std::sort(out.begin(), out.end(), [](const LrcLine& a, const LrcLine& b) { return a.time < b.time; });
+    return out;
+}
+
+std::vector<LrcLine> ParseLrcFile(const std::string& path) {
+    std::ifstream f(path);
+    if (!f) return {};
+    std::string content((std::istreambuf_iterator<char>(f)),
+                        std::istreambuf_iterator<char>());
+    return ParseLrcText(content);
+}
+
+int CurrentLrcIndex(const std::vector<LrcLine>& lrc, double pos) {
+    int idx = -1;
+    for (size_t i = 0; i < lrc.size(); ++i) {
+        if (lrc[i].time <= pos) idx = static_cast<int>(i);
+        else break;
+    }
+    return idx;
+}
+
+// ---- 配置持久化(简易 JSON, 与 C++ 版 termus.json 同格式) ----
+
+std::string ConfigPath() {
+    const char* home = std::getenv("USERPROFILE");
+    std::string dir = home ? std::string(home) : ".";
+    return dir + "/termus.json";
+}
+
+std::string JsonEscape(const std::string& s) {
+    std::string out;
+    for (char c : s) {
+        if (c == '"' || c == '\\') { out += '\\'; out += c; }
+        else if (c == '\n') out += "\\n";
+        else out += c;
+    }
+    return out;
+}
+
+void SaveConfig() {
+    std::ofstream f(ConfigPath());
+    if (!f) return;
+    f << "{\n";
+    f << "  \"volume\": " << g_player.volume() << ",\n";
+    f << "  \"mode\": " << static_cast<int>(g_player.mode()) << ",\n";
+    f << "  \"speed\": " << g_player.speed() << ",\n";
+    f << "  \"eqEnabled\": " << (g_player.eqEnabled() ? "true" : "false") << ",\n";
+    f << "  \"autoPlay\": " << (g_autoPlay ? "true" : "false") << ",\n";
+    f << "  \"showLrcPanel\": " << (g_showLrcPanel ? "true" : "false") << ",\n";
+    f << "  \"eq\": [";
+    for (int b = 0; b < kEqBands; ++b) {
+        if (b) f << ", ";
+        f << g_player.eqBand(b);
+    }
+    f << "],\n";
+    f << "  \"favorites\": [";
+    for (size_t i = 0; i < g_favorites.size(); ++i) {
+        if (i) f << ", ";
+        f << "\"" << JsonEscape(g_favorites[i]) << "\"";
+    }
+    f << "],\n";
+    f << "  \"history\": [";
+    for (size_t i = 0; i < g_history.size(); ++i) {
+        if (i) f << ", ";
+        f << "\"" << JsonEscape(g_history[i]) << "\"";
+    }
+    f << "]\n";
+    f << "}\n";
+}
+
+void LoadConfig() {
+    std::ifstream f(ConfigPath());
+    if (!f) return;
+    std::string content((std::istreambuf_iterator<char>(f)),
+                        std::istreambuf_iterator<char>());
+    auto findNum = [&](const std::string& key, double& out) {
+        auto p = content.find("\"" + key + "\"");
+        if (p == std::string::npos) return false;
+        p = content.find(':', p);
+        if (p == std::string::npos) return false;
+        out = std::atof(content.c_str() + p + 1);
+        return true;
+    };
+    auto findBool = [&](const std::string& key, bool& out) {
+        auto p = content.find("\"" + key + "\"");
+        if (p == std::string::npos) return false;
+        p = content.find(':', p);
+        if (p == std::string::npos) return false;
+        out = content.compare(p + 1, 4, "true") == 0;
+        return true;
+    };
+    auto findArray = [&](const std::string& key, std::vector<std::string>& out) {
+        auto p = content.find("\"" + key + "\"");
+        if (p == std::string::npos) return false;
+        p = content.find('[', p);
+        if (p == std::string::npos) return false;
+        size_t q = p + 1;
+        while (true) {
+            q = content.find('"', q);
+            if (q == std::string::npos || q > content.find(']', p)) break;
+            size_t e = content.find('"', q + 1);
+            if (e == std::string::npos) break;
+            out.push_back(content.substr(q + 1, e - q - 1));
+            q = e + 1;
+        }
+        return true;
+    };
+    double d = 0;
+    if (findNum("volume", d)) g_player.setVolume(static_cast<int>(d));
+    if (findNum("mode", d)) {
+        while (static_cast<int>(d) > 3) d -= 4;
+        for (int i = 0; i < static_cast<int>(d); ++i) g_player.cycleMode();
+    }
+    if (findNum("speed", d)) g_player.setSpeed(static_cast<float>(d));
+    bool b = false;
+    if (findBool("eqEnabled", b)) g_player.setEqEnabled(b);
+    auto eqp = content.find("\"eq\"");
+    if (eqp != std::string::npos) {
+        auto lb = content.find('[', eqp);
+        auto rb = content.find(']', eqp);
+        if (lb != std::string::npos && rb != std::string::npos) {
+            std::string arr = content.substr(lb + 1, rb - lb - 1);
+            size_t s = 0;
+            for (int i = 0; i < kEqBands; ++i) {
+                float v = static_cast<float>(std::atof(arr.c_str() + s));
+                g_player.setEqBand(i, v);
+                s = arr.find(',', s);
+                if (s == std::string::npos) break;
+                ++s;
+            }
+        }
+    }
+    findArray("favorites", g_favorites);
+    findArray("history", g_history);
+    if (findBool("autoPlay", b)) g_autoPlay = b;
+    if (findBool("showLrcPanel", b)) g_showLrcPanel = b;
+    g_autoplaySel = g_autoPlay ? 1 : 0;
+    g_showlrcSel = g_showLrcPanel ? 0 : 1;
+}
+
+// ---- 频谱可视化 ----
+
+Element spectrumViz() {
+    static const char* glyphs[] = {" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"};
+    std::vector<Element> cols;
+    float levels[Player::kSpectrumBands];
+    g_player.spectrumLevels(levels, Player::kSpectrumBands);
+    for (int b = 0; b < Player::kSpectrumBands; ++b) {
+        int units = static_cast<int>(levels[b] * 8.0f + 0.5f);
+        if (units < 0) units = 0;
+        if (units > 8) units = 8;
+        Color c = b < 4 ? Color::Cyan : (b < 8 ? Color::Green : Color::Magenta);
+        cols.push_back(text(glyphs[units]) | color(units > 0 ? c : Color::GrayDark));
+    }
+    return hbox(cols);
+}
+
+// 歌词渲染(高亮当前行)
+Element lrcRender(const std::vector<LrcLine>& lrc, double pos) {
+    int idx = CurrentLrcIndex(lrc, pos);
+    int start = 0, end = 0;
+    if (idx >= 0) {
+        start = std::max(0, idx - 4);
+        end = std::min(static_cast<int>(lrc.size()), idx + 5);
+    } else if (!lrc.empty()) {
+        end = std::min(static_cast<int>(lrc.size()), 5);
+    }
+    std::vector<Element> lines;
+    for (int i = start; i < end; ++i) {
+        if (i == idx) {
+            lines.push_back(text("▶ " + lrc[static_cast<size_t>(i)].text) | bold | color(Color::Cyan));
+        } else {
+            lines.push_back(text("  " + lrc[static_cast<size_t>(i)].text) | dim);
+        }
+    }
+    return vbox(lines);
+}
 
 // 静态字符串缓冲(线程不安全但只被 UI 线程读取)
 std::string g_titleBuf, g_modeBuf, g_codecBuf, g_eqPresetBuf, g_favBuf;
@@ -67,24 +341,6 @@ const float kEqPresets[kEqPresetCount][kEqBands] = {
     {0, 0, 0, 0, 0, 0, 1, 3, 5, 6},
 };
 int g_eqPresetIdx = 0;
-
-std::string FormatTime(double sec) {
-    if (sec < 0) sec = 0;
-    auto total = static_cast<int>(sec);
-    return std::to_string(total / 60) + ":" +
-           (total % 60 < 10 ? "0" : "") + std::to_string(total % 60);
-}
-
-std::string BaseName(const std::string& path) {
-    return std::filesystem::path(path).filename().string();
-}
-
-std::string FormatBitrate(int64_t br) {
-    if (br <= 0) return "?";
-    if (br >= 1000000) return std::to_string(br / 1000000) + "." +
-                               std::to_string((br % 1000000) / 100000) + "Mbps";
-    return std::to_string(br / 1000) + "kbps";
-}
 
 // 扫描音频目录(与 ter-music 一致的扩展名集合)
 std::vector<std::string> ScanAudioDir(const std::string& dir) {
@@ -202,6 +458,11 @@ int64_t termus_playlist_refresh(const char* dir) {
     g_player.setPlaylist(g_files);
     g_hasPlaylist = !g_files.empty();
     if (g_selected >= static_cast<int>(g_files.size())) g_selected = 0;
+    // 重建显示条目: Menu 引用 g_entries, 刷新后 UI 立即更新
+    g_entries.clear();
+    for (size_t i = 0; i < g_files.size(); ++i) {
+        g_entries.push_back("  " + std::to_string(i + 1) + ". " + BaseName(g_files[i]));
+    }
     return static_cast<int64_t>(g_files.size());
 }
 
@@ -243,6 +504,8 @@ void termus_ui_start(termus_cb_play cb_play, termus_cb_void cb_toggle,
                      termus_cb_void cb_speed, termus_cb_void cb_eq,
                      termus_cb_void cb_eq_preset, termus_cb_void cb_refresh,
                      termus_cb_void cb_fav, termus_cb_void cb_exit) {
+    // 自动全屏: 由启动器负责 (wt --maximized 或 .lnk 最大化运行)
+    // 程序内 ShowWindow 会改变终端尺寸, 干扰 FTXUI Fullscreen 事件循环(点击无响应)
     g_cb_play = cb_play;
     g_cb_toggle = cb_toggle;
     g_cb_stop = cb_stop;
@@ -261,20 +524,55 @@ void termus_ui_start(termus_cb_play cb_play, termus_cb_void cb_toggle,
     // 初始化音频输出 (waveOut)。不调用则 hwo_ 为空, AudioOut::start 静默失败 → 无声
     g_player.initOutput();
 
+    // 加载持久化配置(音量/模式/速度/EQ/收藏/历史/设置项)
+    LoadConfig();
+    if (g_autoPlay && !g_files.empty()) {
+        g_player.play(0);
+        g_history.insert(g_history.begin(), g_files[0]);
+        if (g_history.size() > 100) g_history.pop_back();
+    }
+
     auto screen = ScreenInteractive::Fullscreen();
     g_screen = &screen;
 
-    // 播放列表条目(随 refresh 更新)
-    auto entries = std::make_shared<std::vector<std::string>>();
-    for (size_t i = 0; i < g_files.size(); ++i) {
-        entries->push_back("  " + std::to_string(i + 1) + ". " + BaseName(g_files[i]));
-    }
+    // 歌词状态
+    std::vector<LrcLine> lrc;
+    std::string lrcFile;
+    size_t lrcTrackIndex = SIZE_MAX;
+    int lrcSource = 0;  // 0=自动 1=外置 2=内嵌
+    auto lrcSourceName = [](int s) -> const char* {
+        return s == 0 ? "自动" : (s == 1 ? "外置" : "内嵌");
+    };
+    auto loadLrcFor = [&](size_t idx) {
+        if (idx >= g_files.size()) { lrc.clear(); return; }
+        std::string base = g_files[idx];
+        std::string lrcPath = base.substr(0, base.find_last_of('.')) + ".lrc";
+        lrcFile = lrcPath;
+        std::string emb = g_player.embeddedLyrics();
+        bool haveEmb = !emb.empty();
+        std::vector<LrcLine> ext = ParseLrcFile(lrcPath);
+        if (lrcSource == 1) {
+            lrc = ext;
+        } else {
+            lrc = haveEmb ? ParseLrcText(emb) : ext;
+        }
+    };
 
-    auto playlist = Menu(entries.get(), &g_selected);
+    // 播放列表条目: Menu 直接引用全局 g_entries (refresh 时重建, UI 即更新)
+    auto playlist = Menu(&g_entries, &g_selected);
     auto volume_slider = Slider(" 音量", &g_uiVolume, 0.0f, 100.0f, 1.0f);
 
-    auto btn_play = Button(" ▶ 播放 ", [&] { if (g_cb_play) g_cb_play(g_selected); });
-    auto btn_pause = Button(" ⏸ 播放/暂停 ", [&] { if (g_cb_toggle) g_cb_toggle(); });
+    // 播放/暂停合一(双状态, 同 C++ 版): 点击切换, 文本随播放状态变化
+    std::string playLabel = " ▶ 播放 ";
+    auto updatePlayPauseLabel = [&] {
+        playLabel = (g_player.state() == Player::State::Playing)
+            ? " ⏸ 暂停 "
+            : " ▶ 播放 ";
+    };
+    auto btn_play_pause = Button(&playLabel, [&] {
+        if (g_cb_toggle) g_cb_toggle();
+        updatePlayPauseLabel();  // 立即刷新按钮文本
+    });
     auto btn_prev = Button(" ⏮ 上一首 ", [&] { if (g_cb_prev) g_cb_prev(); });
     auto btn_next = Button(" ⏭ 下一首 ", [&] { if (g_cb_next) g_cb_next(); });
     auto btn_stop = Button(" ⏹ 停止 ", [&] { if (g_cb_stop) g_cb_stop(); });
@@ -284,10 +582,10 @@ void termus_ui_start(termus_cb_play cb_play, termus_cb_void cb_toggle,
     auto btn_eq_preset = Button(" 🎚 预设 ", [&] { if (g_cb_eq_preset) g_cb_eq_preset(); });
     auto btn_refresh = Button(" 🔄 刷新 ", [&] { if (g_cb_refresh) g_cb_refresh(); });
     auto btn_fav = Button(" ♥ 收藏 ", [&] { if (g_cb_fav) g_cb_fav(); });
-    auto btn_exit = Button(" ✕ 退出 ", [&] { screen.Exit(); });
+    auto btn_exit = Button(" ✕ 退出 ", [&] { SaveConfig(); screen.Exit(); });
 
     auto controls = Container::Horizontal({
-        btn_play, btn_pause, btn_prev, btn_next, btn_stop, btn_mode,
+        btn_play_pause, btn_prev, btn_next, btn_stop, btn_mode,
         btn_speed, btn_eq, btn_eq_preset, btn_refresh, btn_fav, btn_exit,
     });
     auto right_panel = Container::Vertical({volume_slider});
@@ -295,6 +593,24 @@ void termus_ui_start(termus_cb_play cb_play, termus_cb_void cb_toggle,
         Container::Horizontal({playlist, right_panel}),
         controls,
     });
+
+    // ---- 设置页组件 ----
+    std::vector<std::string> autoplay_entries = {"关", "开"};
+    std::vector<std::string> showlrc_entries = {"开", "关"};
+    auto toggle_autoplay = Toggle(autoplay_entries, &g_autoplaySel);
+    auto toggle_showlrc = Toggle(showlrc_entries, &g_showlrcSel);
+    auto btn_clear_hist = Button(" 清空历史 ", [&] {
+        g_history.clear();
+    });
+    auto btn_settings_back = Button(" ◀ 返回主界面 ", [&] { g_viewSel = 0; });
+    auto settings_panel = Container::Vertical({
+        toggle_autoplay,
+        toggle_showlrc,
+        btn_clear_hist,
+        btn_settings_back,
+    });
+    std::vector<Component> views = {layout, settings_panel};
+    auto view_container = Container::Tab(views, &g_viewSel);
 
     // UI 刷新 tick
     std::atomic<bool> running{true};
@@ -305,17 +621,59 @@ void termus_ui_start(termus_cb_play cb_play, termus_cb_void cb_toggle,
         }
     });
 
+    // 双击播放: 记录上次点击时间与行, 300ms 内同位置再点则播放
+    auto last_click = std::chrono::steady_clock::now();
+    int last_click_y = -1;
+
     // 快捷键 + 刷新事件
-    auto component = CatchEvent(layout, [&](Event event) {
+    auto component = CatchEvent(view_container, [&](Event event) {
+        if (event.is_mouse() && event.mouse().button == Mouse::Left &&
+            event.mouse().motion == Mouse::Pressed) {
+            auto now = std::chrono::steady_clock::now();
+            auto dt = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_click).count();
+            int y = event.mouse().y;
+            if (dt < 300 && y == last_click_y && g_hasPlaylist) {
+                if (g_cb_play) g_cb_play(g_selected);
+                last_click_y = -1;  // 防三击连播
+                return true;
+            }
+            last_click = now;
+            last_click_y = y;
+            return false;  // 单击: 交给 Menu 选中条目
+        }
         if (event == Event::Custom) {
             // 音量滑块同步到播放器
             if (std::abs(g_uiVolume - static_cast<float>(g_player.volume())) > 0.5f) {
                 g_player.setVolume(static_cast<int>(g_uiVolume));
             }
+            // 切歌检测: 加载对应歌词 + 封面
+            size_t ci = g_player.currentIndex();
+            if (ci != lrcTrackIndex) {
+                lrcTrackIndex = ci;
+                loadLrcFor(ci);
+                CoverLoadFor(ci, g_files);
+            }
+            return true;
+        }
+        if (event == Event::Character('s') || event == Event::Character('S')) {
+            g_autoPlay = g_autoplaySel == 1;
+            g_showLrcPanel = g_showlrcSel == 0;
+            g_viewSel = g_viewSel == 0 ? 1 : 0;
+            return true;
+        }
+        if (event == Event::Character('\x0c') || event == Event::Character('\x0C')) {  // Ctrl+L
+            lrcSource = (lrcSource + 1) % 3;
+            loadLrcFor(g_player.currentIndex());
             return true;
         }
         if (event == Event::Return) {
-            if (g_cb_play && g_hasPlaylist) g_cb_play(g_selected);
+            if (g_cb_play && g_hasPlaylist) {
+                g_cb_play(g_selected);
+                if (g_selected >= 0 && static_cast<size_t>(g_selected) < g_files.size()) {
+                    g_history.insert(g_history.begin(), g_files[static_cast<size_t>(g_selected)]);
+                    if (g_history.size() > 100) g_history.pop_back();
+                }
+            }
             return true;
         }
         if (event == Event::Character(' ')) {
@@ -347,6 +705,7 @@ void termus_ui_start(termus_cb_play cb_play, termus_cb_void cb_toggle,
             return true;
         }
         if (event == Event::Character('q') || event == Event::Character('Q')) {
+            SaveConfig();
             screen.Exit();
             return true;
         }
@@ -355,6 +714,15 @@ void termus_ui_start(termus_cb_play cb_play, termus_cb_void cb_toggle,
 
     // 渲染
     auto renderer = Renderer(component, [&] {
+        // 播放/暂停按钮文本随状态刷新
+        updatePlayPauseLabel();
+        // 封面按当前终端尺寸动态生成
+        {
+            auto term = Terminal::Size();
+            int tw = term.dimx > 0 ? term.dimx : 120;
+            int th = term.dimy > 0 ? term.dimy : 40;
+            CoverEnsureCells(tw, th);
+        }
         Player::State st = g_player.state();
         std::string state_str;
         Color state_color = Color::GrayDark;
@@ -397,7 +765,26 @@ void termus_ui_start(termus_cb_play cb_play, termus_cb_void cb_toggle,
         auto info_render = vbox({
             text(" 正在播放 ") | bold | inverted,
             separator(),
-            text(title) | bold | color(Color::Yellow) | flex_grow,
+            // 歌名: paragraph 支持长歌名分两行
+            paragraph(title) | bold | color(Color::Yellow) | flex_grow,
+            // 封面(歌曲名下方, 进度条上方; half-block ▀, 无边框, 居中)
+            [&]() -> Element {
+                if (g_coverCells.empty()) return text("");
+                int cols = g_coverGenW, rows = g_coverGenH;
+                std::vector<Element> rows_e;
+                for (int c2 = 0; c2 < rows; ++c2) {
+                    std::vector<Element> r2;
+                    for (int c3 = 0; c3 < cols; ++c3) {
+                        const CoverCell& cell = g_coverCells[static_cast<size_t>(c2) * cols + c3];
+                        // ▀ (U+2580): 上半块实心, 前景色=上像素, 背景色=下像素, 无缝
+                        r2.push_back(text("▀") |
+                            color(Color::RGB(cell.r1, cell.g1, cell.b1)) |
+                            bgcolor(Color::RGB(cell.r2, cell.g2, cell.b2)));
+                    }
+                    rows_e.push_back(hbox(std::move(r2)));
+                }
+                return vbox(std::move(rows_e));
+            }() | center,
             text(""),
             progress_bar,
             text(""),
@@ -414,10 +801,37 @@ void termus_ui_start(termus_cb_play cb_play, termus_cb_void cb_toggle,
             text(" EQ: " + std::string(g_player.eqEnabled() ? "开" : "关") +
                  "   预设: " + kEqPresetNames[g_eqPresetIdx]) |
                 color(g_player.eqEnabled() ? Color::Green : Color::GrayDark),
+            text(" 频谱:") | dim,
+            spectrumViz(),
             text(" 收藏: " + std::string(isFav ? "♥ 已收藏" : "♡ 未收藏") +
-                 "   共 " + std::to_string(g_favorites.size()) + " 首") | dim,
+                 "   历史: " + std::to_string(g_history.size()) + " 首") | dim,
+            text("\n 最近播放:") | dim,
+            [&]() -> Element {
+                std::vector<Element> hl;
+                size_t n = std::min<size_t>(g_history.size(), 5);
+                for (size_t i = 0; i < n; ++i) {
+                    hl.push_back(text("  " + std::to_string(i + 1) + ". " + BaseName(g_history[i])) | dim);
+                }
+                return vbox(hl);
+            }(),
             text(""),
         });
+
+        // ---- 设置视图 ----
+        if (g_viewSel == 1) {
+            return vbox({
+                hbox({
+                    text(" ⚙ Termus 设置 ") | bold | color(Color::Cyan),
+                    text("S=返回") | dim,
+                }),
+                separator(),
+                settings_panel->Render() | frame | flex,
+                separator(),
+                hbox({
+                    text(" 自动播放: 启动时自动播放第一首    显示歌词: 主界面歌词面板开关    清空历史: 删除播放历史") | dim,
+                }),
+            });
+        }
 
         return vbox({
             hbox({
@@ -430,6 +844,17 @@ void termus_ui_start(termus_cb_play cb_play, termus_cb_void cb_toggle,
                 separator(),
                 info_render | flex_grow,
             }) | flex,
+            separator(),
+            // 歌词(全宽独立区, 可在设置里关闭)
+            g_showLrcPanel
+                ? vbox({
+                      hbox({
+                          text(" 歌词[" + std::string(lrcSourceName(lrcSource)) + "] ") | bold | dim,
+                          text(lrcSource == 1 ? lrcFile : "(内嵌/自动)") | dim | flex_grow,
+                      }),
+                      lrcRender(lrc, pos) | flex,
+                  })
+                : text(" 歌词面板已关闭 (S 进入设置开启)") | dim | flex,
             separator(),
             controls->Render() | center,
             separator(),
@@ -445,12 +870,15 @@ void termus_ui_start(termus_cb_play cb_play, termus_cb_void cb_toggle,
                 text("   " + std::string(g_hasPlaylist ? std::to_string(g_files.size()) : "0") + " 个文件") | dim | flex_grow,
             }),
             hbox({
-                text(" 回车=播放  空格=播放/暂停  ←/→=±5秒  +/-=音量  M=模式  R=刷新  Q=退出") | dim,
+                text(" 回车=播放  空格=播放/暂停  ←/→=±5秒  +/-=音量  M=模式  R=刷新  S=设置  Ctrl+L=歌词  Q=退出") | dim,
             }),
         });
     });
 
     screen.Loop(renderer);
+
+    // 退出: 保存配置
+    SaveConfig();
 
     running = false;
     if (ticker.joinable()) ticker.join();
