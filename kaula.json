@@ -20,10 +20,12 @@
     "avfilter",
     "swresample",
     "avutil",
+    "z",
     "ole32",
     "avrt",
     "uuid",
     "bcrypt",
-    "winmm"
+    "winmm",
+    "ws2_32"
   ]
 }

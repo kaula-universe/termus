@@ -145,6 +145,33 @@ bool decodeToRgb(const uint8_t* data, size_t size, int& w, int& h,
                         ok = true;
                         break;
                     }
+                    case AV_PIX_FMT_RGBA:
+                    case AV_PIX_FMT_BGRA: {
+                        // PNG 解码器默认输出 RGBA/BGRA: 取前 3 通道(忽略 alpha)
+                        for (int y = 0; y < h; ++y) {
+                            const uint8_t* row = frame->data[0] + static_cast<size_t>(y) * frame->linesize[0];
+                            for (int x = 0; x < w; ++x) {
+                                const uint8_t* p = row + static_cast<size_t>(x) * 4;
+                                if (fmt == AV_PIX_FMT_RGBA) put(x, y, p[0], p[1], p[2]);
+                                else put(x, y, p[2], p[1], p[0]);
+                            }
+                        }
+                        ok = true;
+                        break;
+                    }
+                    case AV_PIX_FMT_PAL8: {
+                        // 调色板格式(PNG 可能输出): 通过调色板查表
+                        const uint8_t* pal = frame->data[1];
+                        for (int y = 0; y < h; ++y) {
+                            const uint8_t* row = frame->data[0] + static_cast<size_t>(y) * frame->linesize[0];
+                            for (int x = 0; x < w; ++x) {
+                                const uint8_t* p = pal + static_cast<size_t>(row[x]) * 4;
+                                put(x, y, p[0], p[1], p[2]);
+                            }
+                        }
+                        ok = true;
+                        break;
+                    }
                     default:
                         // 其它(含 GRAY8): 取 data[0] 作为亮度, 复制为灰
                         if (frame->linesize[0] >= w) {

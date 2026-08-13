@@ -540,6 +540,52 @@ void termus_ui_start(termus_cb_play cb_play, termus_cb_void cb_toggle,
     std::string lrcFile;
     size_t lrcTrackIndex = SIZE_MAX;
     int lrcSource = 0;  // 0=自动 1=外置 2=内嵌
+    // 播放历史弹窗(H 键, 原版样式): 最近 10 首, 可上下选择回车播放
+    bool showHistory = false;
+    int histSel = 0;
+
+    // ---- 搜索(/ 键, 原版样式): 过滤播放列表 ----
+    std::string searchQuery;
+    std::vector<std::string> searchResults;
+    auto doSearch = [&] {
+        searchResults.clear();
+        if (searchQuery.empty()) {
+            for (auto& f : g_files) searchResults.push_back(f);
+            return;
+        }
+        std::string q = searchQuery;
+        std::transform(q.begin(), q.end(), q.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        for (auto& f : g_files) {
+            std::string name = BaseName(f);
+            std::transform(name.begin(), name.end(), name.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (name.find(q) != std::string::npos) searchResults.push_back(f);
+        }
+    };
+
+    // ---- 帮助弹窗(? 键): 快捷键说明 ----
+    bool showHelp = false;
+    const std::vector<std::string> helpLines = {
+        " ♫ Termus 快速上手 ",
+        " ──────────────── ",
+        " 播放:   回车=播放选中  空格=播放/暂停",
+        " 导航:   ↑/↓=选择曲目  ←/→=快退/快进5秒",
+        " 音量:   +/=增大  -=减小",
+        " 模式:   M=切换播放模式",
+        " 速度:   ⏩ 按钮循环 0.75x~3.0x",
+        " EQ:     🎛 开关  🎚 预设循环",
+        " 列表:   R=刷新  🔄 按钮",
+        " 收藏:   ♥ 按钮  (配置自动保存)",
+        " 历史:   H=播放历史弹窗",
+        " 搜索:   /=搜索过滤播放列表",
+        " 歌词:   Ctrl+L=切换歌词来源(自动/外置/内嵌)",
+        " 设置:   S=进入/退出设置页",
+        " 退出:   Q 或 ✕ 按钮",
+        " 双击:   列表双击曲目播放",
+        " ──────────────── ",
+        " Esc=关闭本帮助",
+    };
     auto lrcSourceName = [](int s) -> const char* {
         return s == 0 ? "自动" : (s == 1 ? "外置" : "内嵌");
     };
@@ -609,7 +655,15 @@ void termus_ui_start(termus_cb_play cb_play, termus_cb_void cb_toggle,
         btn_clear_hist,
         btn_settings_back,
     });
-    std::vector<Component> views = {layout, settings_panel};
+    // ---- 搜索视图(/ 键): 输入框 + 结果列表 ----
+    auto search_input = Input(&searchQuery, "输入关键词过滤...");
+    int searchSel = 0;
+    auto btn_search_back = Button(" ◀ 返回播放列表 ", [&] { g_viewSel = 0; });
+    auto search_panel = Container::Vertical({
+        search_input,
+        btn_search_back,
+    });
+    std::vector<Component> views = {layout, settings_panel, search_panel};
     auto view_container = Container::Tab(views, &g_viewSel);
 
     // UI 刷新 tick
@@ -659,6 +713,54 @@ void termus_ui_start(termus_cb_play cb_play, termus_cb_void cb_toggle,
             g_autoPlay = g_autoplaySel == 1;
             g_showLrcPanel = g_showlrcSel == 0;
             g_viewSel = g_viewSel == 0 ? 1 : 0;
+            showHistory = false;
+            showHelp = false;
+            return true;
+        }
+        if (event == Event::Character('/')) {
+            if (g_viewSel == 2) {
+                g_viewSel = 0;
+            } else if (!g_files.empty()) {
+                searchQuery.clear();
+                searchSel = 0;
+                g_viewSel = 2;
+            }
+            return true;
+        }
+        if (event == Event::Character('?') ) {
+            showHelp = !showHelp;
+            return true;
+        }
+        if (showHelp && event == Event::Escape) {
+            showHelp = false;
+            return true;
+        }
+        if (g_viewSel == 2) {
+            // 搜索视图: ↑↓ 选择, 回车播放, Esc 关闭
+            if (event == Event::ArrowUp && searchSel > 0) { searchSel--; return true; }
+            if (event == Event::ArrowDown && searchSel + 1 < static_cast<int>(searchResults.size())) { searchSel++; return true; }
+            if (event == Event::Escape) { g_viewSel = 0; return true; }
+            if (event == Event::Return && !searchResults.empty() &&
+                searchSel >= 0 && static_cast<size_t>(searchSel) < searchResults.size()) {
+                if (g_cb_play) {
+                    auto it = std::find(g_files.begin(), g_files.end(), searchResults[static_cast<size_t>(searchSel)]);
+                    if (it != g_files.end()) {
+                        size_t idx = static_cast<size_t>(it - g_files.begin());
+                        g_cb_play(static_cast<int>(idx));
+                        g_selected = static_cast<int>(idx);
+                        g_history.insert(g_history.begin(), g_files[idx]);
+                        if (g_history.size() > 100) g_history.pop_back();
+                    }
+                }
+                g_viewSel = 0;
+                return true;
+            }
+        }
+        if (event == Event::Character('h') || event == Event::Character('H')) {
+            if (!g_history.empty()) {
+                showHistory = !showHistory;
+                histSel = 0;
+            }
             return true;
         }
         if (event == Event::Character('\x0c') || event == Event::Character('\x0C')) {  // Ctrl+L
@@ -667,6 +769,26 @@ void termus_ui_start(termus_cb_play cb_play, termus_cb_void cb_toggle,
             return true;
         }
         if (event == Event::Return) {
+            if (showHistory) {
+                // 历史弹窗内回车: 播放选中项
+                if (g_cb_play && g_hasPlaylist && !g_history.empty() &&
+                    histSel >= 0 && static_cast<size_t>(histSel) < g_history.size()) {
+                    auto it = std::find(g_files.begin(), g_files.end(),
+                                        g_history[static_cast<size_t>(histSel)]);
+                    if (it != g_files.end()) {
+                        size_t idx = static_cast<size_t>(it - g_files.begin());
+                        g_cb_play(static_cast<int>(idx));
+                        g_selected = static_cast<int>(idx);
+                        g_history.erase(std::remove(g_history.begin(), g_history.end(),
+                                                    g_history[static_cast<size_t>(histSel)]),
+                                        g_history.end());
+                        g_history.insert(g_history.begin(), g_files[idx]);
+                        if (g_history.size() > 100) g_history.pop_back();
+                    }
+                }
+                showHistory = false;
+                return true;
+            }
             if (g_cb_play && g_hasPlaylist) {
                 g_cb_play(g_selected);
                 if (g_selected >= 0 && static_cast<size_t>(g_selected) < g_files.size()) {
@@ -675,6 +797,12 @@ void termus_ui_start(termus_cb_play cb_play, termus_cb_void cb_toggle,
                 }
             }
             return true;
+        }
+        if (showHistory) {
+            // 历史弹窗: ↑↓ 选择, Esc 关闭
+            if (event == Event::ArrowUp && histSel > 0) { histSel--; return true; }
+            if (event == Event::ArrowDown && histSel + 1 < static_cast<int>(g_history.size())) { histSel++; return true; }
+            if (event == Event::Escape) { showHistory = false; return true; }
         }
         if (event == Event::Character(' ')) {
             if (g_cb_toggle) g_cb_toggle();
@@ -716,11 +844,13 @@ void termus_ui_start(termus_cb_play cb_play, termus_cb_void cb_toggle,
     auto renderer = Renderer(component, [&] {
         // 播放/暂停按钮文本随状态刷新
         updatePlayPauseLabel();
-        // 封面按当前终端尺寸动态生成
+        // 封面按当前终端尺寸动态生成 + 右栏宽度
+        int termW = 120;
         {
             auto term = Terminal::Size();
             int tw = term.dimx > 0 ? term.dimx : 120;
             int th = term.dimy > 0 ? term.dimy : 40;
+            termW = tw;
             CoverEnsureCells(tw, th);
         }
         Player::State st = g_player.state();
@@ -804,16 +934,7 @@ void termus_ui_start(termus_cb_play cb_play, termus_cb_void cb_toggle,
             text(" 频谱:") | dim,
             spectrumViz(),
             text(" 收藏: " + std::string(isFav ? "♥ 已收藏" : "♡ 未收藏") +
-                 "   历史: " + std::to_string(g_history.size()) + " 首") | dim,
-            text("\n 最近播放:") | dim,
-            [&]() -> Element {
-                std::vector<Element> hl;
-                size_t n = std::min<size_t>(g_history.size(), 5);
-                for (size_t i = 0; i < n; ++i) {
-                    hl.push_back(text("  " + std::to_string(i + 1) + ". " + BaseName(g_history[i])) | dim);
-                }
-                return vbox(hl);
-            }(),
+                 "   历史: " + std::to_string(g_history.size()) + " 首 (H 查看)") | dim,
             text(""),
         });
 
@@ -830,31 +951,62 @@ void termus_ui_start(termus_cb_play cb_play, termus_cb_void cb_toggle,
                 hbox({
                     text(" 自动播放: 启动时自动播放第一首    显示歌词: 主界面歌词面板开关    清空历史: 删除播放历史") | dim,
                 }),
+                separator(),
+                hbox({
+                    text(" 关于: Termus (Kaula/FTXUI 版) — 灵感来自 ter-music v2.1.0 (浣软科技)") | dim,
+                }),
             });
         }
 
-        return vbox({
+        // ---- 搜索视图 ----
+        if (g_viewSel == 2) {
+            doSearch();
+            std::vector<Element> res;
+            size_t n = searchResults.size();
+            for (size_t i = 0; i < n; ++i) {
+                std::string label = " " + std::to_string(i + 1) + ". " + BaseName(searchResults[i]);
+                res.push_back(text(label) |
+                    (static_cast<int>(i) == searchSel ? bold | color(Color::Yellow) : dim));
+            }
+            return vbox({
+                hbox({
+                    text(" 🔍 搜索 ") | bold | color(Color::Cyan),
+                    text(" /=返回  Esc=关闭") | dim,
+                }),
+                separator(),
+                search_input->Render(),
+                text(" 匹配 " + std::to_string(n) + " 首  (↑↓选择, 回车播放)") | dim,
+                separator(),
+                vbox(std::move(res)) | frame | flex,
+            });
+        }
+
+        auto main_ui = vbox({
             hbox({
                 text(" ♫ Termus ") | bold | color(Color::Cyan),
                 text("Kaula + FTXUI + FFmpeg + waveOut") | dim,
             }),
             separator(),
+            // 两列布局(同 C++ 版): 左列=列表+歌词(flex), 右列=信息(固定 2/5 宽)
             hbox({
-                list_render | flex,
+                vbox({
+                    list_render | flex,
+                    separator(),
+                    // 歌词块(左列下方)
+                    g_showLrcPanel
+                        ? vbox({
+                              hbox({
+                                  text(" 歌词[" + std::string(lrcSourceName(lrcSource)) + "] ") | bold | dim,
+                                  text(lrcSource == 1 ? lrcFile : "(内嵌/自动)") | dim | flex_grow,
+                              }),
+                              lrcRender(lrc, pos) | flex,
+                          })
+                        : text(" 歌词面板已关闭 (S 进入设置开启)") | dim | flex,
+                }) | flex,
                 separator(),
-                info_render | flex_grow,
+                // 右栏 = 终端宽 * 2/5 (动态)
+                info_render | size(WIDTH, EQUAL, termW * 2 / 5),
             }) | flex,
-            separator(),
-            // 歌词(全宽独立区, 可在设置里关闭)
-            g_showLrcPanel
-                ? vbox({
-                      hbox({
-                          text(" 歌词[" + std::string(lrcSourceName(lrcSource)) + "] ") | bold | dim,
-                          text(lrcSource == 1 ? lrcFile : "(内嵌/自动)") | dim | flex_grow,
-                      }),
-                      lrcRender(lrc, pos) | flex,
-                  })
-                : text(" 歌词面板已关闭 (S 进入设置开启)") | dim | flex,
             separator(),
             controls->Render() | center,
             separator(),
@@ -865,14 +1017,45 @@ void termus_ui_start(termus_cb_play cb_play, termus_cb_void cb_toggle,
                 text("   " + dirInfo) | dim | flex_grow,
             }),
             hbox({
-                text(" 音频: " + std::string(g_player.audioOk() ? "开" : "关(静默, waveOut初始化失败)")) |
-                    color(g_player.audioOk() ? Color::Green : Color::Red),
-                text("   " + std::string(g_hasPlaylist ? std::to_string(g_files.size()) : "0") + " 个文件") | dim | flex_grow,
-            }),
-            hbox({
-                text(" 回车=播放  空格=播放/暂停  ←/→=±5秒  +/-=音量  M=模式  R=刷新  S=设置  Ctrl+L=歌词  Q=退出") | dim,
+                text(" 回车=播放  空格=播放/暂停  ←/→=±5秒  +/-=音量  M=模式  R=刷新  S=设置  H=历史  /=搜索  ?=帮助  Ctrl+L=歌词  Q=退出") | dim,
             }),
         });
+
+        // 播放历史弹窗(H 键, 原版样式): 居中覆盖
+        if (showHistory) {
+            std::vector<Element> hrows;
+            size_t n = std::min<size_t>(g_history.size(), 10);
+            hrows.push_back(text(" 播放历史 ") | bold | inverted);
+            hrows.push_back(separator());
+            for (size_t i = 0; i < n; ++i) {
+                std::string label = " " + std::to_string(i + 1) + ". " + BaseName(g_history[i]);
+                hrows.push_back(text(label) |
+                    (static_cast<int>(i) == histSel ? bold | color(Color::Yellow) : dim));
+            }
+            hrows.push_back(separator());
+            hrows.push_back(text(" ↑↓=选择  回车=播放  Esc=关闭") | dim);
+            auto hist_box = vbox(std::move(hrows)) | border |
+                size(WIDTH, EQUAL, 50) | size(HEIGHT, EQUAL, static_cast<int>(n) + 4);
+            main_ui = dbox({
+                main_ui,
+                hist_box | center,
+            });
+        }
+
+        // 帮助弹窗(? 键): 快捷键说明, 居中覆盖
+        if (showHelp) {
+            std::vector<Element> hlp;
+            for (auto& line : helpLines) {
+                hlp.push_back(text(line) | dim);
+            }
+            auto help_box = vbox(std::move(hlp)) | border |
+                size(WIDTH, EQUAL, 50);
+            main_ui = dbox({
+                main_ui,
+                help_box | center,
+            });
+        }
+        return main_ui;
     });
 
     screen.Loop(renderer);
