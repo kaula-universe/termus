@@ -27,6 +27,8 @@ extern "C" {
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <chrono>
+#include <cstdio>
 #include <iostream>
 #include <map>
 #include <sstream>
@@ -46,6 +48,21 @@ std::vector<std::string> g_favorites;
 std::vector<std::string> g_history;
 std::string g_scanDir;
 bool g_hasPlaylist = false;
+
+// 睡眠定时器(T 键循环 30/60/90/关): 到点暂停, 标题栏显示倒计时
+int g_sleepMin = 0;
+bool g_sleepActive = false;
+std::chrono::steady_clock::time_point g_sleepEnd;
+std::string g_sleepMsg;
+uint64_t g_sleepMsgMs = 0;   // 提示消息显示截止(epoch ms)
+
+// 歌曲详情弹窗(i 键)
+bool g_showDetail = false;
+
+static uint64_t nowMs() {
+    return static_cast<uint64_t>(
+        std::chrono::steady_clock::now().time_since_epoch().count() / 1000000ULL);
+}
 
 // 设置项(持久化)
 bool g_autoPlay = false;
@@ -1018,6 +1035,8 @@ void termus_ui_start(termus_cb_play cb_play, termus_cb_void cb_toggle,
         " 列表:   R=刷新  🔄 按钮",
         " 收藏:   ♥ 按钮  (配置自动保存)",
         " 历史:   H=播放历史弹窗",
+        " 睡眠:   T=定时器(30/60/90分钟循环, 到点暂停)",
+        " 详情:   i=当前歌曲信息弹窗",
         " 搜索:   /=搜索过滤播放列表",
         " 歌词:   Ctrl+L=切换歌词来源(自动/外置/内嵌)",
         " 设置:   S=进入/退出设置页",
@@ -1259,8 +1278,17 @@ void termus_ui_start(termus_cb_play cb_play, termus_cb_void cb_toggle,
             return false;  // 单击: 交给 Menu 选中条目
         }
         if (event == Event::Custom) {
-            // 音量滑块同步到播放器
-            if (std::abs(g_uiVolume - static_cast<float>(g_player.volume())) > 0.5f) {
+            // 睡眠定时器: 到点暂停 + 提示
+            if (g_sleepActive && std::chrono::steady_clock::now() >= g_sleepEnd) {
+                g_sleepActive = false;
+                g_sleepMin = 0;
+                g_sleepMsg = "睡眠定时器到点,已暂停";
+                g_sleepMsgMs = nowMs() + 2500;
+                g_player.pause();
+            }
+            // 音量滑块同步到播放器(淡入淡出进行中不打断)
+            if (g_player.state() == Player::State::Playing && !g_player.isFading() &&
+                std::abs(g_uiVolume - static_cast<float>(g_player.volume())) > 0.5f) {
                 g_player.setVolume(static_cast<int>(g_uiVolume));
             }
             // 切歌检测: 加载对应歌词 + 封面
@@ -1294,8 +1322,35 @@ void termus_ui_start(termus_cb_play cb_play, termus_cb_void cb_toggle,
             showHelp = !showHelp;
             return true;
         }
+        // T: 睡眠定时器(循环 30/60/90/关, 大小写通吃)
+        if (event == Event::Character('t') || event == Event::Character('T')) {
+            if (g_sleepActive) {
+                g_sleepActive = false;
+                g_sleepMin = 0;
+                g_sleepMsg = "睡眠定时器已取消";
+            } else {
+                if (g_sleepMin == 0) g_sleepMin = 30;
+                else if (g_sleepMin == 30) g_sleepMin = 60;
+                else if (g_sleepMin == 60) g_sleepMin = 90;
+                else g_sleepMin = 30;
+                g_sleepEnd = std::chrono::steady_clock::now() + std::chrono::minutes(g_sleepMin);
+                g_sleepActive = true;
+                g_sleepMsg = "睡眠定时器 " + std::to_string(g_sleepMin) + " 分钟";
+            }
+            g_sleepMsgMs = nowMs() + 2500;
+            return true;
+        }
+        // i: 歌曲详情弹窗
+        if (event == Event::Character('i') || event == Event::Character('I')) {
+            g_showDetail = !g_showDetail;
+            return true;
+        }
         if (showHelp && event == Event::Escape) {
             showHelp = false;
+            return true;
+        }
+        if (g_showDetail && event == Event::Escape) {
+            g_showDetail = false;
             return true;
         }
         // ---- 播放队列: 在队列视图内按 a = 把当前曲目追加 ----
@@ -1937,6 +1992,22 @@ void termus_ui_start(termus_cb_play cb_play, termus_cb_void cb_toggle,
         auto main_ui = vbox({
             hbox({
                 text("♫ termus kaula + ftxui + ffmpeg + waveout ♫") | bold | color(Color::Cyan),
+                // 睡眠定时器状态(倒计时/提示消息)
+                [&]() -> Element {
+                    if (!g_sleepMsg.empty() && nowMs() < g_sleepMsgMs) {
+                        return text(" " + g_sleepMsg + " ") | color(Color::Yellow);
+                    }
+                    if (g_sleepActive) {
+                        auto remain = std::chrono::duration_cast<std::chrono::seconds>(
+                            g_sleepEnd - std::chrono::steady_clock::now()).count();
+                        if (remain < 0) remain = 0;
+                        char sb[32];
+                        snprintf(sb, sizeof(sb), "🔒 %02d:%02d",
+                                 static_cast<int>(remain / 60), static_cast<int>(remain % 60));
+                        return text(std::string(" ") + sb + " ") | color(Color::Yellow);
+                    }
+                    return text("");
+                }() | flex_grow,
             }),
             separator(),
             // 两列布局(同 C++ 版): 左列=列表+歌词(flex), 右列=信息(固定 2/5 宽)
@@ -1967,7 +2038,7 @@ void termus_ui_start(termus_cb_play cb_play, termus_cb_void cb_toggle,
                 text("   " + dirInfo) | dim | flex_grow,
             }),
             hbox({
-                text(" 回车=播放  空格=播放/暂停  ←/→=±5秒  +/-=音量  M=音乐库  R=刷新  S=设置  H=历史  /=搜索  ?=帮助  F4=歌单  A=加入歌单  Tab=队列  Q=退出") | dim,
+                text(" 回车=播放  空格=播放/暂停  ←/→=±5秒  +/-=音量  M=音乐库  R=刷新  S=设置  H=历史  /=搜索  ?=帮助  F4=歌单  A=加入歌单  Tab=队列  T=睡眠  i=详情  Q=退出") | dim,
             }),
         });
 
@@ -1989,6 +2060,34 @@ void termus_ui_start(termus_cb_play cb_play, termus_cb_void cb_toggle,
             main_ui = dbox({
                 main_ui,
                 hist_box | center,
+            });
+        }
+
+        // 歌曲详情弹窗(i 键): 当前曲目信息, 居中覆盖
+        if (g_showDetail) {
+            std::vector<Element> drows;
+            drows.push_back(text(" 歌曲信息 ") | bold | inverted);
+            drows.push_back(separator());
+            size_t ci = g_player.currentIndex();
+            std::string title = (ci < g_files.size()) ? BaseName(g_files[ci]) : "-";
+            double dur = g_player.duration();
+            char dbuf[64];
+            snprintf(dbuf, sizeof(dbuf), "%d:%02d", static_cast<int>(dur) / 60,
+                     static_cast<int>(dur) % 60);
+            drows.push_back(text(" 标题: " + title) | dim);
+            drows.push_back(text(" 时长: " + std::string(dbuf)) | dim);
+            drows.push_back(text(" 编码: " + g_player.codecName()) | dim);
+            drows.push_back(text(" 采样率: " + std::to_string(g_player.sampleRate()) + " Hz") | dim);
+            drows.push_back(text(" 位深: " + std::to_string(g_player.bitDepth()) + " bit") | dim);
+            drows.push_back(text(" 码率: " + std::to_string(g_player.bitRate() / 1000) + " kbps") | dim);
+            drows.push_back(text(" 路径: " + (ci < g_files.size() ? g_files[ci] : std::string("-"))) | dim);
+            drows.push_back(separator());
+            drows.push_back(text(" Esc=关闭") | dim);
+            auto detail_box = vbox(std::move(drows)) | border |
+                size(WIDTH, EQUAL, 64);
+            main_ui = dbox({
+                main_ui,
+                detail_box | center,
             });
         }
 

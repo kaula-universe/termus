@@ -56,6 +56,11 @@ public:
     void setVolume(int pct);
     int volume() const;
 
+    // 淡入淡出: 从当前音量渐变到 targetPct, 耗时 ms 毫秒。
+    // 渐变在音频回调内插值(不阻塞); isFading() 查询是否进行中。
+    void fadeTo(int targetPct, int ms);
+    bool isFading() const;
+
     // 变速(0.5x - 2.0x, 保调)
     void setSpeed(float speed);
     float speed() const;
@@ -97,6 +102,7 @@ private:
     void requestTrackChange();
     void wakeDecoder();
     void rebuildTempoGraph();   // 变速变化时重建 atempo 滤镜图
+    void fadeToLocked(int targetPct, int ms);   // 调用方须持有 ctlMutex_
     void applyEq(float* data, size_t samples);  // f32 交错, 就地滤波
     void analyzeSpectrum(const float* data, size_t samples);  // 音频回调采样做 DFT
 
@@ -162,6 +168,15 @@ private:
     State state_ = State::Stopped;
     Mode mode_ = Mode::ListRepeat;
     int volumePct_ = 80;
+
+    // 淡入淡出状态(fillAudio 内插值)
+    bool fading_ = false;
+    int fadeFromPct_ = 0;
+    int fadeToPct_ = 0;
+    uint64_t fadeStartMs_ = 0;
+    uint64_t fadeDurMs_ = 0;
+    bool pauseAfterFade_ = false;   // 淡出到 0 后自动暂停
+    int fadeResumePct_ = 80;        // 淡出前音量(暂停恢复时淡入目标)
 
     AudioOut audio_;
     bool audioOk_ = false;

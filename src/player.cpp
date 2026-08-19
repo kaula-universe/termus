@@ -257,6 +257,9 @@ void Player::play(size_t index) {
         if (playlist_.empty()) return;
         if (index < playlist_.size()) index_ = index;
         state_ = State::Playing;
+        // 切歌淡入(300ms): 若正在进行中的渐变(如暂停淡出)则重置
+        pauseAfterFade_ = false;
+        fadeToLocked(volumePct_, 300);
     }
     if (!decoderRunning_.load()) {
         decoderRunning_ = true;
@@ -273,9 +276,14 @@ void Player::play(size_t index) {
 void Player::toggle() {
     std::lock_guard<std::mutex> lock(ctlMutex_);
     if (state_ == State::Playing) {
-        state_ = State::Paused;
+        // 暂停: 先淡出 300ms, 渐变到 0 后在音频回调内自动置 Paused
+        pauseAfterFade_ = true;
+        fadeResumePct_ = volumePct_;
+        fadeToLocked(0, 300);
     } else if (state_ == State::Paused || state_ == State::Stopped) {
         state_ = State::Playing;
+        pauseAfterFade_ = false;
+        fadeToLocked(fadeResumePct_, 300);   // 恢复: 从 0 淡入回原音量
     }
     wakeDecoder();
 }
@@ -296,6 +304,8 @@ void Player::stop() {
     {
         std::lock_guard<std::mutex> lock(ctlMutex_);
         state_ = State::Stopped;
+        fading_ = false;
+        pauseAfterFade_ = false;
     }
     {
         std::lock_guard<std::mutex> lock(ringMutex_);
@@ -381,6 +391,29 @@ const char* Player::modeName() const {
 void Player::setVolume(int pct) {
     std::lock_guard<std::mutex> lock(ctlMutex_);
     volumePct_ = std::clamp(pct, 0, 100);
+    // 手动调音量时若正在渐变(如暂停淡出)则取消渐变, 立即生效
+    fading_ = false;
+    pauseAfterFade_ = false;
+}
+
+// 内部: 调用方已持有 ctlMutex_
+void Player::fadeToLocked(int targetPct, int ms) {
+    fadeFromPct_ = volumePct_;
+    fadeToPct_ = std::clamp(targetPct, 0, 100);
+    fadeDurMs_ = static_cast<uint64_t>(ms);
+    fadeStartMs_ = static_cast<uint64_t>(
+        std::chrono::steady_clock::now().time_since_epoch().count() / 1000000ULL);
+    fading_ = ms > 0;
+}
+
+void Player::fadeTo(int targetPct, int ms) {
+    std::lock_guard<std::mutex> lock(ctlMutex_);
+    fadeToLocked(targetPct, ms);
+}
+
+bool Player::isFading() const {
+    std::lock_guard<std::mutex> lock(ctlMutex_);
+    return fading_;
 }
 
 int Player::volume() const {
@@ -817,6 +850,27 @@ UINT32 Player::fillAudio(float* dst, UINT32 maxFrames) {
         st = state_;
     }
     float gain = static_cast<float>(volumePct_) / 100.0f;
+
+    // 淡入淡出: 按时间插值增益(回调驱动, 不阻塞)
+    if (fading_) {
+        uint64_t now = static_cast<uint64_t>(
+            std::chrono::steady_clock::now().time_since_epoch().count() / 1000000ULL);
+        uint64_t elapsed = now - fadeStartMs_;
+        float t = fadeDurMs_ > 0
+            ? std::min(1.0f, static_cast<float>(elapsed) / static_cast<float>(fadeDurMs_))
+            : 1.0f;
+        gain = (static_cast<float>(fadeFromPct_) +
+                (static_cast<float>(fadeToPct_) - static_cast<float>(fadeFromPct_)) * t) / 100.0f;
+        if (t >= 1.0f) {
+            fading_ = false;
+            volumePct_ = fadeToPct_;
+            if (pauseAfterFade_ && fadeToPct_ == 0) {
+                std::lock_guard<std::mutex> lock3(ctlMutex_);
+                state_ = State::Paused;
+                pauseAfterFade_ = false;
+            }
+        }
+    }
 
     if (st != State::Playing) {
         return 0;  // 静音
