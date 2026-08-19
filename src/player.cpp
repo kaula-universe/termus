@@ -341,7 +341,13 @@ void Player::prev() {
 
 void Player::cycleMode() {
     std::lock_guard<std::mutex> lock(ctlMutex_);
-    mode_ = static_cast<Mode>((static_cast<int>(mode_) + 1) % 5);
+    mode_ = static_cast<Mode>((static_cast<int>(mode_) + 1) % 17);
+}
+
+void Player::setTagCache(const std::vector<std::string>& albums, const std::vector<std::string>& artists) {
+    std::lock_guard<std::mutex> lock(ctlMutex_);
+    albums_ = albums;
+    artists_ = artists;
 }
 
 Player::Mode Player::mode() const {
@@ -351,11 +357,23 @@ Player::Mode Player::mode() const {
 
 const char* Player::modeName() const {
     switch (mode()) {
-        case Mode::Sequential:   return "顺序播放";
-        case Mode::ListRepeat:   return "列表循环";
-        case Mode::SingleRepeat: return "单曲循环";
-        case Mode::Shuffle:      return "随机播放";
-        case Mode::ShuffleOnce:  return "随机单次";
+        case Mode::Sequential:          return "顺序播放";
+        case Mode::ListRepeat:          return "列表循环";
+        case Mode::SingleRepeat:        return "单曲循环";
+        case Mode::Shuffle:             return "随机播放";
+        case Mode::ShuffleOnce:         return "随机单次";
+        case Mode::AlbumSequential:     return "专辑顺序";
+        case Mode::AlbumRepeat:         return "专辑循环";
+        case Mode::AlbumShuffle:        return "专辑随机";
+        case Mode::AlbumShuffleRepeat:  return "专辑随机循环";
+        case Mode::ArtistSequential:    return "艺术家顺序";
+        case Mode::ArtistRepeat:        return "艺术家循环";
+        case Mode::ArtistShuffle:       return "艺术家随机";
+        case Mode::ArtistShuffleRepeat: return "艺术家随机循环";
+        case Mode::FolderSequential:    return "文件夹顺序";
+        case Mode::FolderRepeat:        return "文件夹循环";
+        case Mode::FolderShuffle:       return "文件夹随机";
+        case Mode::FolderShuffleRepeat: return "文件夹随机循环";
     }
     return "?";
 }
@@ -427,17 +445,78 @@ void Player::computeNextIndex() {
     std::lock_guard<std::mutex> lock(ctlMutex_);
     size_t n = playlist_.size();
     if (n == 0) return;
+    // 高级模式: 收集与当前曲目同专辑/同艺术家/同文件夹的索引范围
+    auto collectRange = [&](bool byAlbum, bool byArtist, bool byFolder, std::vector<size_t>& out) {
+        for (size_t i = 0; i < n; ++i) {
+            if (byAlbum && albums_.size() == n && i < albums_.size() && index_ < albums_.size() &&
+                albums_[i] == albums_[index_] && !albums_[i].empty()) { out.push_back(i); continue; }
+            if (byArtist && artists_.size() == n && i < artists_.size() && index_ < artists_.size() &&
+                artists_[i] == artists_[index_] && !artists_[i].empty()) { out.push_back(i); continue; }
+            if (byFolder && i != index_) {
+                // 文件夹模式: 路径去掉文件名后相同
+                auto dirOf = [](const std::string& p) {
+                    auto pos = p.find_last_of("/\\");
+                    return pos == std::string::npos ? std::string() : p.substr(0, pos);
+                };
+                if (dirOf(playlist_[i]) == dirOf(playlist_[index_])) { out.push_back(i); continue; }
+            }
+        }
+        if (out.empty()) {
+            // 标签缺失时退化为全部(基础行为)
+            for (size_t i = 0; i < n; ++i) out.push_back(i);
+        }
+    };
+    bool repeat = false, shuffle = false, limited = false;
     switch (mode_) {
         case Mode::Shuffle:
         case Mode::ShuffleOnce:
-            index_ = static_cast<size_t>(rand()) % n;
+            shuffle = true;
             break;
         case Mode::SingleRepeat:
-            break;  // 同一首
+            return;  // 同一首
+        case Mode::AlbumSequential:    limited = true; repeat = false; shuffle = false; break;
+        case Mode::AlbumRepeat:        limited = true; repeat = true;  shuffle = false; break;
+        case Mode::AlbumShuffle:       limited = true; repeat = false; shuffle = true;  break;
+        case Mode::AlbumShuffleRepeat: limited = true; repeat = true;  shuffle = true;  break;
+        case Mode::ArtistSequential:    limited = true; repeat = false; shuffle = false; break;
+        case Mode::ArtistRepeat:        limited = true; repeat = true;  shuffle = false; break;
+        case Mode::ArtistShuffle:       limited = true; repeat = false; shuffle = true;  break;
+        case Mode::ArtistShuffleRepeat: limited = true; repeat = true;  shuffle = true;  break;
+        case Mode::FolderSequential:    limited = true; repeat = false; shuffle = false; break;
+        case Mode::FolderRepeat:        limited = true; repeat = true;  shuffle = false; break;
+        case Mode::FolderShuffle:       limited = true; repeat = false; shuffle = true;  break;
+        case Mode::FolderShuffleRepeat: limited = true; repeat = true;  shuffle = true;  break;
         default:
-            index_ = (index_ + 1) % n;
-            break;
+            break;  // Sequential / ListRepeat: 基础行为
     }
+    if (limited) {
+        std::vector<size_t> range;
+        bool byAlbum = mode_ >= Mode::AlbumSequential && mode_ <= Mode::AlbumShuffleRepeat;
+        bool byArtist = mode_ >= Mode::ArtistSequential && mode_ <= Mode::ArtistShuffleRepeat;
+        bool byFolder = mode_ >= Mode::FolderSequential && mode_ <= Mode::FolderShuffleRepeat;
+        collectRange(byAlbum, byArtist, byFolder, range);
+        if (shuffle) {
+            index_ = range[static_cast<size_t>(rand()) % range.size()];
+        } else {
+            // 在当前范围中找 index_ 的下一个(顺序/循环)
+            auto it = std::find(range.begin(), range.end(), index_);
+            if (it != range.end()) {
+                size_t pos = static_cast<size_t>(it - range.begin());
+                if (repeat) {
+                    index_ = range[(pos + 1) % range.size()];
+                } else {
+                    if (pos + 1 < range.size()) index_ = range[pos + 1];
+                    // 范围末尾不循环(顺序模式自然停止)
+                }
+            }
+        }
+        return;
+    }
+    if (shuffle) {
+        index_ = static_cast<size_t>(rand()) % n;
+        return;
+    }
+    index_ = (index_ + 1) % n;
 }
 
 bool Player::openCurrent() {
@@ -485,11 +564,16 @@ bool Player::openCurrent() {
         bitDepth_ = av_get_bytes_per_sample(codecCtx_->sample_fmt) * 8;
         bitRate_ = codecCtx_->bit_rate > 0 ? codecCtx_->bit_rate : fmtCtx_->bit_rate;
         if (bitRate_ <= 0) bitRate_ = 0;
-        // 内嵌歌词: ID3 USLT / Vorbis lyrics 等会映射到 metadata 的 "lyrics" 键
+        // 内嵌歌词: ID3 USLT / Vorbis lyrics 映射为 "lyrics" / "lyrics-<lang>" 键
+        // (如 lyrics-und)。注意: 必须遍历找 "lyrics" 前缀, av_dict_get("lyrics") 精确
+        // 匹配不到 "lyrics-und", AV_DICT_IGNORE_SUFFIX 语义是条目 key 以被查 key 结尾。
         embeddedLyrics_.clear();
-        AVDictionaryEntry* lyr = av_dict_get(fmtCtx_->metadata, "lyrics", nullptr, AV_DICT_IGNORE_SUFFIX);
-        if (lyr && lyr->value) {
-            embeddedLyrics_ = lyr->value;
+        const AVDictionaryEntry* e = nullptr;
+        while ((e = av_dict_iterate(fmtCtx_->metadata, e))) {
+            if (strncmp(e->key, "lyrics", 6) == 0 && e->value) {
+                embeddedLyrics_ = e->value;
+                break;
+            }
         }
     }
 

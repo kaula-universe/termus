@@ -24,7 +24,13 @@ constexpr float kEqFreqs[kEqBands] = {31, 62, 125, 250, 500, 1000, 2000, 4000, 8
 class Player {
 public:
     enum class State { Stopped, Playing, Paused };
-    enum class Mode { Sequential, ListRepeat, SingleRepeat, Shuffle, ShuffleOnce };
+    // 17 种模式(原版): 5 基础 + 12 高级(专辑/艺术家/文件夹 × 顺序/循环/随机/随机重复)
+    enum class Mode {
+        Sequential, ListRepeat, SingleRepeat, Shuffle, ShuffleOnce,
+        AlbumSequential, AlbumRepeat, AlbumShuffle, AlbumShuffleRepeat,
+        ArtistSequential, ArtistRepeat, ArtistShuffle, ArtistShuffleRepeat,
+        FolderSequential, FolderRepeat, FolderShuffle, FolderShuffleRepeat
+    };
 
     Player();
     ~Player();
@@ -33,6 +39,8 @@ public:
     bool initOutput();
 
     void setPlaylist(std::vector<std::string> files);
+    // 高级模式标签缓存: index -> album / artist (未设置时高级模式退化为基础模式)
+    void setTagCache(const std::vector<std::string>& albums, const std::vector<std::string>& artists);
     void play(size_t index);
     void toggle();
     void pause();
@@ -148,6 +156,8 @@ private:
     // 控制状态
     mutable std::mutex ctlMutex_;
     std::vector<std::string> playlist_;
+    std::vector<std::string> albums_;    // 标签缓存: index -> album
+    std::vector<std::string> artists_;   // 标签缓存: index -> artist
     size_t index_ = 0;
     State state_ = State::Stopped;
     Mode mode_ = Mode::ListRepeat;
