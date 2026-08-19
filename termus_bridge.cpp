@@ -2007,7 +2007,7 @@ void termus_ui_start(termus_cb_play cb_play, termus_cb_void cb_toggle,
                         return text(std::string(" ") + sb + " ") | color(Color::Yellow);
                     }
                     return text("");
-                }() | flex_grow,
+                }(),
             }),
             separator(),
             // 两列布局(同 C++ 版): 左列=列表+歌词(flex), 右列=信息(固定 2/5 宽)
