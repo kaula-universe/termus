@@ -1852,8 +1852,10 @@ void termus_ui_start(termus_cb_play cb_play, termus_cb_void cb_toggle,
         auto info_render = vbox({
             text(" 正在播放 ") | bold | inverted,
             separator(),
-            // 歌名: paragraph 支持长歌名分两行
-            paragraph(title) | bold | color(Color::Yellow) | flex_grow,
+            // 歌名: paragraph 支持长歌名换行(限制宽度, 避免超长歌名撑宽右栏
+            // 导致 frame 裁左、封面 center 参照宽失真而偏右)
+            paragraph(title) | bold | color(Color::Yellow) |
+                size(WIDTH, EQUAL, std::max(20, termW * 2 / 5 - 4)) | flex_grow,
             // 封面(歌名下方)
             [&]() -> Element {
                 if (g_coverCells.empty()) return text("");
