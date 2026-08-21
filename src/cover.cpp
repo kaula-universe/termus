@@ -81,8 +81,7 @@ bool decodeToRgb(const uint8_t* data, size_t size, int& w, int& h,
                     rgb[o] = r; rgb[o + 1] = g; rgb[o + 2] = b;
                 };
                 switch (fmt) {
-                    case AV_PIX_FMT_YUV420P:
-                    case AV_PIX_FMT_YUVJ420P: {
+                    case AV_PIX_FMT_YUV420P: {
                         for (int y = 0; y < h; ++y) {
                             for (int x = 0; x < w; ++x) {
                                 uint8_t Y = frame->data[0][static_cast<size_t>(y) * frame->linesize[0] + x];
@@ -98,8 +97,25 @@ bool decodeToRgb(const uint8_t* data, size_t size, int& w, int& h,
                         ok = true;
                         break;
                     }
-                    case AV_PIX_FMT_YUV422P:
-                    case AV_PIX_FMT_YUVJ422P: {
+                    // YUVJ* = JPEG full range(Y 0-255): 用 full range 公式(Y 不减 16),
+                    // 否则暗部偏红/偏灰(limited 偏移对全范围 Y 错误)
+                    case AV_PIX_FMT_YUVJ420P: {
+                        for (int y = 0; y < h; ++y) {
+                            for (int x = 0; x < w; ++x) {
+                                uint8_t Y = frame->data[0][static_cast<size_t>(y) * frame->linesize[0] + x];
+                                uint8_t U = frame->data[1][static_cast<size_t>(y / 2) * frame->linesize[1] + x / 2];
+                                uint8_t V = frame->data[2][static_cast<size_t>(y / 2) * frame->linesize[2] + x / 2];
+                                int c = static_cast<int>(Y), d = static_cast<int>(U) - 128, e = static_cast<int>(V) - 128;
+                                put(x, y,
+                                    static_cast<uint8_t>(std::clamp((256 * c + 359 * e + 128) >> 8, 0, 255)),
+                                    static_cast<uint8_t>(std::clamp((256 * c - 88 * d - 183 * e + 128) >> 8, 0, 255)),
+                                    static_cast<uint8_t>(std::clamp((256 * c + 454 * d + 128) >> 8, 0, 255)));
+                            }
+                        }
+                        ok = true;
+                        break;
+                    }
+                    case AV_PIX_FMT_YUV422P: {
                         for (int y = 0; y < h; ++y) {
                             for (int x = 0; x < w; ++x) {
                                 uint8_t Y = frame->data[0][static_cast<size_t>(y) * frame->linesize[0] + x];
@@ -115,8 +131,23 @@ bool decodeToRgb(const uint8_t* data, size_t size, int& w, int& h,
                         ok = true;
                         break;
                     }
-                    case AV_PIX_FMT_YUV444P:
-                    case AV_PIX_FMT_YUVJ444P: {
+                    case AV_PIX_FMT_YUVJ422P: {
+                        for (int y = 0; y < h; ++y) {
+                            for (int x = 0; x < w; ++x) {
+                                uint8_t Y = frame->data[0][static_cast<size_t>(y) * frame->linesize[0] + x];
+                                uint8_t U = frame->data[1][static_cast<size_t>(y) * frame->linesize[1] + x / 2];
+                                uint8_t V = frame->data[2][static_cast<size_t>(y) * frame->linesize[2] + x / 2];
+                                int c = static_cast<int>(Y), d = static_cast<int>(U) - 128, e = static_cast<int>(V) - 128;
+                                put(x, y,
+                                    static_cast<uint8_t>(std::clamp((256 * c + 359 * e + 128) >> 8, 0, 255)),
+                                    static_cast<uint8_t>(std::clamp((256 * c - 88 * d - 183 * e + 128) >> 8, 0, 255)),
+                                    static_cast<uint8_t>(std::clamp((256 * c + 454 * d + 128) >> 8, 0, 255)));
+                            }
+                        }
+                        ok = true;
+                        break;
+                    }
+                    case AV_PIX_FMT_YUV444P: {
                         for (int y = 0; y < h; ++y) {
                             for (int x = 0; x < w; ++x) {
                                 uint8_t Y = frame->data[0][static_cast<size_t>(y) * frame->linesize[0] + x];
@@ -127,6 +158,22 @@ bool decodeToRgb(const uint8_t* data, size_t size, int& w, int& h,
                                     static_cast<uint8_t>(std::clamp((298 * c + 409 * e + 128) >> 8, 0, 255)),
                                     static_cast<uint8_t>(std::clamp((298 * c - 100 * d - 208 * e + 128) >> 8, 0, 255)),
                                     static_cast<uint8_t>(std::clamp((298 * c + 516 * d + 128) >> 8, 0, 255)));
+                            }
+                        }
+                        ok = true;
+                        break;
+                    }
+                    case AV_PIX_FMT_YUVJ444P: {
+                        for (int y = 0; y < h; ++y) {
+                            for (int x = 0; x < w; ++x) {
+                                uint8_t Y = frame->data[0][static_cast<size_t>(y) * frame->linesize[0] + x];
+                                uint8_t U = frame->data[1][static_cast<size_t>(y) * frame->linesize[1] + x];
+                                uint8_t V = frame->data[2][static_cast<size_t>(y) * frame->linesize[2] + x];
+                                int c = static_cast<int>(Y), d = static_cast<int>(U) - 128, e = static_cast<int>(V) - 128;
+                                put(x, y,
+                                    static_cast<uint8_t>(std::clamp((256 * c + 359 * e + 128) >> 8, 0, 255)),
+                                    static_cast<uint8_t>(std::clamp((256 * c - 88 * d - 183 * e + 128) >> 8, 0, 255)),
+                                    static_cast<uint8_t>(std::clamp((256 * c + 454 * d + 128) >> 8, 0, 255)));
                             }
                         }
                         ok = true;
@@ -333,24 +380,67 @@ std::vector<CoverCell> coverCellsFromRgb(const CoverImage& img,
     std::vector<CoverCell> cells;
     if (!img.valid() || targetCols <= 0 || targetRows <= 0) return cells;
 
-    // 3. Lanczos 缩放到 cols x (rows*2) 像素 (half-block 每字符格 = 2 行像素)
-    int pw = targetCols * kCellW, ph = targetRows * kCellH;
+    // 3. Lanczos 缩放到 cols*2 x rows*2 像素 (quadrant: 每字符格 = 2x2 像素, 形状分辨率横向翻倍)
+    int pw = targetCols * 2, ph = targetRows * 2;
     std::vector<uint8_t> scaled(static_cast<size_t>(pw) * ph * 3);
     resizeRgb(img.rgb.data(), img.w, img.h, scaled.data(), pw, ph);
 
-    // 4. 真彩色直接输出(终端 24-bit, 无需量化抖动)。
-    //    双线性缩放本身已平滑; 量化会引入色带发糊, 故省略。
-    //    原 Floyd-Steinberg 抖动(16 级量化)仅为色域受限终端所需。
+    // 4. 每字符格 2x2 像素: 遍历 16 种 quadrant 形状(bitmask TL,TR,BL,BR),
+    //    实心象限取平均 = 前景色, 空心象限取平均 = 背景色, 选总误差最小的分配。
+    static const char* kQuad[16] = {
+        " ", "▘", "▝", "▀", "▖", "▌", "▞", "▛",
+        "▗", "▚", "▐", "▜", "▄", "▙", "▟", "█",
+    };
+    static const int kQx[4] = {0, 1, 0, 1};   // TL, TR, BL, BR
+    static const int kQy[4] = {0, 0, 1, 1};
 
-    // 5. 每字符格取上下两个像素 -> CoverCell (上半=前景色, 下半=背景色)
     cells.reserve(static_cast<size_t>(targetRows) * targetCols);
     for (int row = 0; row < targetRows; ++row) {
         for (int col = 0; col < targetCols; ++col) {
+            uint8_t px[4][3];
+            for (int q = 0; q < 4; ++q) {
+                size_t o = (static_cast<size_t>(row * 2 + kQy[q]) * pw +
+                            (col * 2 + kQx[q])) * 3;
+                px[q][0] = scaled[o];
+                px[q][1] = scaled[o + 1];
+                px[q][2] = scaled[o + 2];
+            }
+            int best = -1;
+            double bestErr = 1e30;
+            uint8_t fg[3] = {0, 0, 0}, bg[3] = {0, 0, 0};
+            for (int m = 0; m < 16; ++m) {
+                int nf = 0, nb = 0;
+                long sf[3] = {0, 0, 0}, sb[3] = {0, 0, 0};
+                for (int q = 0; q < 4; ++q) {
+                    if (m & (1 << q)) {
+                        sf[0] += px[q][0]; sf[1] += px[q][1]; sf[2] += px[q][2]; ++nf;
+                    } else {
+                        sb[0] += px[q][0]; sb[1] += px[q][1]; sb[2] += px[q][2]; ++nb;
+                    }
+                }
+                uint8_t f[3], b[3];
+                if (nf == 0) { f[0] = (uint8_t)(sb[0] / nb); f[1] = (uint8_t)(sb[1] / nb); f[2] = (uint8_t)(sb[2] / nb); }
+                else { f[0] = (uint8_t)(sf[0] / nf); f[1] = (uint8_t)(sf[1] / nf); f[2] = (uint8_t)(sf[2] / nf); }
+                if (nb == 0) { b[0] = f[0]; b[1] = f[1]; b[2] = f[2]; }
+                else { b[0] = (uint8_t)(sb[0] / nb); b[1] = (uint8_t)(sb[1] / nb); b[2] = (uint8_t)(sb[2] / nb); }
+                double err = 0;
+                for (int q = 0; q < 4; ++q) {
+                    const uint8_t* c = (m & (1 << q)) ? f : b;
+                    err += std::abs((int)px[q][0] - c[0]) +
+                           std::abs((int)px[q][1] - c[1]) +
+                           std::abs((int)px[q][2] - c[2]);
+                }
+                if (err < bestErr) {
+                    bestErr = err;
+                    best = m;
+                    fg[0] = f[0]; fg[1] = f[1]; fg[2] = f[2];
+                    bg[0] = b[0]; bg[1] = b[1]; bg[2] = b[2];
+                }
+            }
             CoverCell c;
-            size_t top = (static_cast<size_t>(row * 2) * pw + col) * 3;
-            size_t bot = (static_cast<size_t>(row * 2 + 1) * pw + col) * 3;
-            c.r1 = scaled[top]; c.g1 = scaled[top + 1]; c.b1 = scaled[top + 2];
-            c.r2 = scaled[bot]; c.g2 = scaled[bot + 1]; c.b2 = scaled[bot + 2];
+            c.ch = kQuad[best < 0 ? 0 : best];
+            c.r1 = fg[0]; c.g1 = fg[1]; c.b1 = fg[2];
+            c.r2 = bg[0]; c.g2 = bg[1]; c.b2 = bg[2];
             cells.push_back(c);
         }
     }

@@ -75,73 +75,58 @@ extern fn termus_ui_exit() -> void
 extern fn getenv(name: const char*) -> char*
 
 fn on_play(idx: int) {
-    println("on_play: ", idx)
     termus_play(idx)
 }
 
 fn on_toggle() {
-    println("on_toggle")
     termus_toggle()
 }
 
 fn on_stop() {
-    println("on_stop")
     termus_stop()
 }
 
 fn on_next() {
-    println("on_next")
     termus_next()
 }
 
 fn on_prev() {
-    println("on_prev")
     termus_prev()
 }
 
 fn on_mode() {
-    println("on_mode")
     termus_cycle_mode()
 }
 
 fn on_seek(sec: f64) {
-    println("on_seek: ", sec)
     termus_seek(sec)
 }
 
 fn on_volume(pct: int) {
-    println("on_volume: ", pct)
     termus_set_volume(pct)
 }
 
 fn on_speed() {
-    println("on_speed")
     termus_cycle_speed()
 }
 
 fn on_eq() {
-    println("on_eq")
     termus_set_eq_enabled(1 - termus_eq_enabled())
 }
 
 fn on_eq_preset() {
-    println("on_eq_preset")
     termus_cycle_eq_preset()
 }
 
 fn on_refresh() {
-    println("on_refresh")
-    int n = scan_music()
-    println("刷新: ", n, " 个文件")
+    scan_music()
 }
 
 fn on_fav() {
-    println("on_fav")
     termus_fav_toggle()
 }
 
 fn on_exit() {
-    println("on_exit")
     termus_ui_exit()
 }
 
@@ -162,9 +147,6 @@ fn scan_music() int {
 }
 
 fn main() {
-    println("Termus — Kaula 终端音乐播放器")
     int n = scan_music()
-    println("播放列表: ", n, " 个文件")
     termus_ui_start(on_play, on_toggle, on_stop, on_next, on_prev, on_mode, on_seek, on_volume, on_speed, on_eq, on_eq_preset, on_refresh, on_fav, on_exit)
-    println("再见!")
 }

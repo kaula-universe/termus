@@ -30,7 +30,7 @@ BUILD="$HERE/build"
 mkdir -p "$BUILD"
 
 # -fno-exceptions: 缺省会与 libc++ 的 length_error weak 符号冲突导致 lld 链接失败
-FLAGS="-std=c++23 -O2 -DUNICODE -D_UNICODE -fwrapv -fno-strict-aliasing -fno-exceptions"
+FLAGS="-std=c++23 -O2 -DUNICODE -D_UNICODE -fwrapv -fno-strict-aliasing -fno-exceptions -DFTXUI_MICROSOFT_TERMINAL_FALLBACK"
 INCS="-I$HERE_W -I$FTXUI_ROOT_W/include -I$FTXUI_ROOT_W/src -I$FFMPEG_ROOT_W"
 
 OBJS=()

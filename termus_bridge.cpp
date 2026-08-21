@@ -152,9 +152,15 @@ TrackTags ReadTrackTags(const std::string& path) {
 
 // 渲染时调用: 按终端尺寸动态生成色块(尺寸变化才重算)
 void CoverEnsureCells(int termW, int termH) {
-    int wantCols = termW * 3 / 10;                  // 封面宽 = 终端宽*3/10
-    int wantRows = std::min(wantCols / 2, termH / 2);  // 高 = 宽/2, 不超屏高 1/2(封面更高)
+    // 封面: 高度占满右栏(底部 9 行预算: 歌名1+进度1+音量1+
+    // 分隔1+controls 3+分隔1+状态1), 频谱在左栏不占右栏空间
+    // 宽度 = min(右栏宽, 2×高); 字符格 ~1:1.8 下格子 1.8~2:1 显示均近正方形
+    int wantRows = termH - 9;                     // 高度占满
+    int wantCols = std::min(termW / 2 - 2, 2 * wantRows);  // 宽不超右栏
     if (wantCols < 16) wantCols = 16;
+    if (wantRows < 8) wantRows = 8;
+    // 宽度受限时(窄终端)高度跟随宽度保持 2:1
+    if (wantCols < 2 * wantRows) wantRows = wantCols / 2;
     if (wantRows < 8) wantRows = 8;
     if ((wantCols != g_coverGenW || wantRows != g_coverGenH) && g_coverImg.valid()) {
         g_coverGenW = wantCols;
@@ -180,6 +186,23 @@ std::string FormatBitrate(int64_t br) {
 
 std::string BaseName(const std::string& path) {
     return std::filesystem::path(path).filename().string();
+}
+
+// 按显示宽度截断(中文/宽字符=2, 英文=1), 超长末尾加省略号 … (UTF-8 安全)
+std::string TruncateW(const std::string& s, int maxW) {
+    if (maxW <= 1) return "";
+    int w = 0;
+    size_t i = 0;
+    while (i < s.size()) {
+        unsigned char c = static_cast<unsigned char>(s[i]);
+        int len = c < 0x80 ? 1 : ((c & 0xE0) == 0xC0 ? 2 : ((c & 0xF0) == 0xE0 ? 3 : 4));
+        int cw = len >= 3 ? 2 : 1;   // 3+ 字节 = CJK/宽字符
+        if (w + cw > maxW) break;
+        w += cw;
+        i += static_cast<size_t>(len);
+    }
+    if (i >= s.size()) return s;
+    return s.substr(0, i) + "\u2026";  // …
 }
 
 // ---- LRC 歌词 ----
@@ -389,7 +412,9 @@ void LoadConfig() {
         if (p == std::string::npos) return false;
         p = content.find(':', p);
         if (p == std::string::npos) return false;
-        out = content.compare(p + 1, 4, "true") == 0;
+        ++p;  // 跳过 ':'
+        while (p < content.size() && (content[p] == ' ' || content[p] == '\t')) ++p;  // 跳过空格
+        out = content.compare(p, 4, "true") == 0;
         return true;
     };
     auto findStr = [&](const std::string& key, std::string& out) {
@@ -457,37 +482,71 @@ void LoadConfig() {
     findNum("lastPos", g_lastPos);
 }
 
-// ---- 频谱可视化 ----
+// ---- 频谱可视化(cava 风格) ----
 
-// 频谱可视化: 24 列 3 行高柱状条(12 频段双倍加密, 相邻插值平滑;
-// cava 风格: 高度决定绿→黄→橙→红渐变)
-Element spectrumViz() {
-    std::vector<Element> cols;
+// cava 连续渐变: 绿(0,255,0) → 黄(255,255,0) → 橙(255,128,0) → 红(255,0,0)
+// t: 0(底部)..1(顶部), 关键色线性插值(无分段色带)
+Color cavaGradient(float t) {
+    struct Stop { int r, g, b; };
+    static const Stop stops[4] = {{0, 255, 0}, {255, 255, 0}, {255, 128, 0}, {255, 0, 0}};
+    float x = t * 3.0f;
+    int i = x < 3.0f ? static_cast<int>(x) : 2;
+    float f = x - static_cast<float>(i);
+    int r = static_cast<int>(stops[i].r + f * (stops[i + 1].r - stops[i].r));
+    int g = static_cast<int>(stops[i].g + f * (stops[i + 1].g - stops[i].g));
+    int b = static_cast<int>(stops[i].b + f * (stops[i + 1].b - stops[i].b));
+    return Color::RGB(static_cast<uint8_t>(r), static_cast<uint8_t>(g), static_cast<uint8_t>(b));
+}
+
+// cava 风格频谱: 全宽柱状图, 柱从底部向上生长, 高度渐变(绿→黄→橙→红),
+// 频段对数分布(低音左/高音右), 数据侧已做攻击快/释放慢平滑(近似 cava 的 peak 下落)。
+// height = 柱高(行数), totalWidth = 可用列宽(每柱 2 列: 柱 + 间隙)。
+Element cavaSpectrumViz(int height, int totalWidth) {
+    std::vector<Element> bars;
     float levels[Player::kSpectrumBands];
     g_player.spectrumLevels(levels, Player::kSpectrumBands);
-    int n = Player::kSpectrumBands;
-    for (int i = 0; i < n * 2; ++i) {  // 24 列
-        float lv = levels[std::min(i / 2, n - 1)];
-        if (i % 2 == 1 && i / 2 + 1 < n) lv = (lv + levels[i / 2 + 1]) * 0.5f;  // 插值
-        int units = static_cast<int>(lv * 8.0f + 0.5f);
-        if (units < 0) units = 0;
-        if (units > 8) units = 8;
-        // cava 渐变: 柱越高越亮(绿→黄→橙→红)
-        Color c = Color::GrayDark;
-        if (units >= 1 && units <= 2) c = Color::Green;
-        else if (units <= 4) c = Color::Yellow;
-        else if (units <= 6) c = Color::Orange3;
-        else c = Color::Red;
-        // 3 行高: 顶行(6-8) 中行(3-5) 底行(0-2)
+    const int n = Player::kSpectrumBands;
+    const int cols = std::max(8, totalWidth);  // 每柱 1 列, 左右无间隙
+    for (int i = 0; i < cols; ++i) {
+        // 12 频段线性插值到 cols 柱; 跳过频段 0-1(60-148Hz 人声歌恒 0, 左边缘不空)
+        float t = 2.0f + static_cast<float>(i) / cols * (n - 2);
+        int b0 = static_cast<int>(t);
+        int b1 = std::min(b0 + 1, n - 1);
+        float frac = t - static_cast<float>(b0);
+        float lv = levels[b0] * (1.0f - frac) + levels[b1] * frac;
+        // 低音区(左 1/5 柱)增益 ×1.5(不饱和, 留跳动空间)
+        if (i < cols / 5) lv = std::min(1.0f, lv * 1.5f);
+        // cava 风格: sqrt 非线性放大低电平(无额外增益, 柱随数据变化不钉死)
+        float lv2 = std::sqrt(std::min(1.0f, lv));
+        // 根据强度细分: 柱高直接按半格取整(0..2*height), 奇数半格=半块, 偶数=整格
+        int units = static_cast<int>(lv2 * height * 2.0f + 0.5f);
+        if (units < 0) units = 0;  // 无数据不显示(不要默认绿条)
+        if (units > height * 2) units = height * 2;
+        int fillFrom = height * 2 - units;  // 填充起始半格(从底部数)
+        const float maxHalf = 2.0f * height - 1.0f;
         std::vector<Element> col;
-        for (int row = 0; row < 3; ++row) {
-            int base = (2 - row) * 3;
-            bool fill = units > base;
-            col.push_back(text(fill ? "█" : " ") | color(c));
+        for (int r = 0; r < height; ++r) {
+            int hTop = 2 * r;        // 上半半格(0=顶)
+            int hBot = 2 * r + 1;    // 下半半格
+            bool fillTop = hTop >= fillFrom;
+            bool fillBot = hBot >= fillFrom;
+            float posTop = maxHalf > 0 ? 1.0f - hTop / maxHalf : 0.0f;
+            float posBot = maxHalf > 0 ? 1.0f - hBot / maxHalf : 0.0f;
+            Element e;
+            if (fillTop && fillBot) {
+                // 整格: 上半=浅色(顶红), 下半=深色(底绿), 2 色碎块
+                e = text("▀") | color(cavaGradient(posTop)) | bgcolor(cavaGradient(posBot));
+            } else if (fillBot) {
+                // 半块: 只填下半(柱顶半格), 上半留背景
+                e = text("▄") | color(cavaGradient(posBot));
+            } else {
+                e = text(" ");
+            }
+            col.push_back(e);
         }
-        cols.push_back(vbox(std::move(col)) | flex);
+        bars.push_back(vbox(std::move(col)) | flex);
     }
-    return hbox(cols);
+    return hbox(bars);
 }
 
 // ---- EQ 均衡器条(设置页与主界面共用; Kaula 版补齐, 与 C++ 版一致) ----
@@ -741,8 +800,22 @@ void termus_ui_start(termus_cb_play cb_play, termus_cb_void cb_toggle,
                      termus_cb_void cb_speed, termus_cb_void cb_eq,
                      termus_cb_void cb_eq_preset, termus_cb_void cb_refresh,
                      termus_cb_void cb_fav, termus_cb_void cb_exit) {
-    // 固定窗口标题(只改标题, 不影响 FTXUI 事件循环)
+    // 兜底: 强制 FTXUI 按 24-bit 真彩色处理(WT/conhost 不设 TERM/COLORTERM,
+    // FTXUI 会降级到 16 色量化导致封面发灰; 编译宏 FTXUI_MICROSOFT_TERMINAL_FALLBACK 已覆盖,
+    // 这里再显式设 COLORTERM 双保险)
+    _putenv("COLORTERM=truecolor");
     SetConsoleTitleW(L"termus-kaula");
+    // 强制控制台字号 10 (仅 conhost: WT 里有 WT_SESSION 变量则跳过, 由 profile 控制)
+    if (!getenv("WT_SESSION")) {
+        HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+        CONSOLE_FONT_INFOEX cfi = {};
+        cfi.cbSize = sizeof(CONSOLE_FONT_INFOEX);
+        cfi.dwFontSize = {10, 18};      // 10 号 (conhost 标准字号 10x18)
+        cfi.FontFamily = 0x36;          // FF_DONTCARE | TMPF_TRUETYPE
+        cfi.FontWeight = 400;
+        wcscpy(cfi.FaceName, L"Consolas");
+        SetCurrentConsoleFontEx(hOut, FALSE, &cfi);
+    }
     // 自动全屏: 由启动器负责 (wt --maximized 或 .lnk 最大化运行)
     // 程序内 ShowWindow 会改变终端尺寸, 干扰 FTXUI Fullscreen 事件循环(点击无响应)
     g_cb_play = cb_play;
@@ -1160,7 +1233,17 @@ void termus_ui_start(termus_cb_play cb_play, termus_cb_void cb_toggle,
     };
 
     // 播放列表条目: Menu 直接引用全局 g_entries (refresh 时重建, UI 即更新)
-    auto playlist = Menu(&g_entries, &g_selected);
+    // 正在播放的行: 黄色粗体 + ▶ 前缀高亮(选中项仍为反色)
+    MenuOption menu_opt;
+    menu_opt.entries_option.transform = [&](const EntryState& state) {
+        // 正在播放的行: ▶ 前缀 + 黄色粗体(即使选中也保持黄色, 不用反色)
+        bool isPlaying = (static_cast<size_t>(state.index) == g_player.currentIndex());
+        Element e = text(isPlaying ? "▶" + state.label : state.label);
+        if (isPlaying) e = e | bold | color(Color::Yellow);
+        else if (state.active) e = e | inverted;
+        return e;
+    };
+    auto playlist = Menu(&g_entries, &g_selected, menu_opt);
     auto volume_slider = Slider(" 音量", &g_uiVolume, 0.0f, 100.0f, 1.0f);
     // 右栏宽度(渲染器每帧更新; 供进度条/音量条/封面计算)
     int termW = 120;
@@ -1171,7 +1254,7 @@ void termus_ui_start(termus_cb_play cb_play, termus_cb_void cb_toggle,
             return g_player.duration() > 0.0
                        ? g_player.position() / g_player.duration() : 0.0;
         },
-        [&]() -> int { return termW * 2 / 5 - 12; },
+        [&]() -> int { return termW / 2 - 12; },
         Color::Cyan,
         [&]() -> std::string {
             return FormatTime(g_player.position()) + "/" + FormatTime(g_player.duration());
@@ -1184,7 +1267,7 @@ void termus_ui_start(termus_cb_play cb_play, termus_cb_void cb_toggle,
             if (g_cb_volume) g_cb_volume(static_cast<int>(g_uiVolume));
         },
         [&]() -> double { return g_uiVolume / 100.0; },
-        [&]() -> int { return termW * 2 / 5 - 12; },
+        [&]() -> int { return termW / 2 - 12; },
         Color::Green,
         [&]() -> std::string {
             return "音量 " + std::to_string(static_cast<int>(g_uiVolume));
@@ -1842,21 +1925,15 @@ void termus_ui_start(termus_cb_play cb_play, termus_cb_void cb_toggle,
             list_render = vbox(std::move(qrows)) | flex;
         } else {
             list_render = vbox({
-                text(" 播放列表 ") | bold | inverted,
-                separator(),
                 playlist->Render() | frame | flex,
                 text(" " + std::to_string(g_files.size()) + " 个文件  (Tab=队列 a=加入)") | dim,
             });
         }
 
         auto info_render = vbox({
-            text(" 正在播放 ") | bold | inverted,
-            separator(),
-            // 歌名: paragraph 支持长歌名换行(限制宽度, 避免超长歌名撑宽右栏
-            // 导致 frame 裁左、封面 center 参照宽失真而偏右)
-            paragraph(title) | bold | color(Color::Yellow) |
-                size(WIDTH, EQUAL, std::max(20, termW * 2 / 5 - 4)) | flex_grow,
-            // 封面(歌名下方)
+            // 歌名: 单行, 超长省略号; 无标题栏, 封面紧贴(无空行)
+            text(TruncateW(title, std::max(8, termW / 2 - 6))) | bold | color(Color::Yellow),
+            // 封面(歌名正下方, 占满到进度条)
             [&]() -> Element {
                 if (g_coverCells.empty()) return text("");
                 int cols = g_coverGenW, rows = g_coverGenH;
@@ -1865,31 +1942,19 @@ void termus_ui_start(termus_cb_play cb_play, termus_cb_void cb_toggle,
                     std::vector<Element> r2;
                     for (int c3 = 0; c3 < cols; ++c3) {
                         const CoverCell& cell = g_coverCells[static_cast<size_t>(c2) * cols + c3];
-                        // ▀ (U+2580): 上半块实心, 前景色=上像素, 背景色=下像素, 无缝
-                        r2.push_back(text("▀") |
+                        // quadrant 块字符: 实心象限=前景色, 空心象限=背景色 (2x2 像素/格)
+                        r2.push_back(text(cell.ch) |
                             color(Color::RGB(cell.r1, cell.g1, cell.b1)) |
                             bgcolor(Color::RGB(cell.r2, cell.g2, cell.b2)));
                     }
                     rows_e.push_back(hbox(std::move(r2)));
                 }
                 return vbox(std::move(rows_e));
-            }() | center,
+            }() | hcenter | flex_grow,
             progress_bar,   // 左侧时间数字 + 进度条
             volume_bar->Render(),   // 进度条与音量条之间不留空行
-            // 频谱(音量下方, 3 行高, 无标签, 24 列加密; 上下无空行)
-            spectrumViz(),
-            text(" 模式: " + std::string(g_player.modeName()) +
-                 "   速度: " + std::to_string(g_player.speed()).substr(0, 4) + "x") | dim,
-            text(" 编码: " + g_player.codecName() + " | " +
-                 std::to_string(g_player.sampleRate()) + "Hz | " +
-                 std::to_string(g_player.bitDepth()) + "bit | " +
-                 FormatBitrate(g_player.bitRate())) | dim,
-            text(" 均衡器: " + std::string(kEqPresetNames[g_eqPresetIdx])) |
-                color(g_player.eqEnabled() ? Color::Green : Color::GrayDark),
-            eqBars(g_player),
-            text(" 收藏: " + std::string(isFav ? "♥ 已收藏" : "♡ 未收藏") +
-                 "   历史: " + std::to_string(g_history.size()) + " 首 (H 查看)") | dim,
-        }) | frame;
+            // 频谱已移至底部全宽(cava 风格, 见 main_ui)
+        });
 
         // ---- 设置视图 ----
         if (g_viewSel == 1) {
@@ -1992,9 +2057,34 @@ void termus_ui_start(termus_cb_play cb_play, termus_cb_void cb_toggle,
         }
 
         auto main_ui = vbox({
+            // 左列=播放列表+歌词+cava频谱, 右列=内容(歌名/封面/进度/音量, 固定 1/2 宽)
             hbox({
-                text("♫ termus kaula + ftxui + ffmpeg + waveout ♫") | bold | color(Color::Cyan),
-                // 睡眠定时器状态(倒计时/提示消息)
+                vbox({
+                    list_render | flex,
+                    separator(),
+                    // 歌词块(左栏中部)
+                    vbox({
+                        hbox({
+                            text(" 歌词[" + std::string(lrcSourceName(lrcSource)) + "] ") | bold | dim,
+                            text(lrcSource == 1 ? lrcFile : "(内嵌/自动)") | dim | flex_grow,
+                        }),
+                        lrcRender(lrc, pos, lrcAlignSel) | flex,
+                    }),
+                    separator(),
+                    // cava 频谱(歌词下面): 占左栏全宽(termW/2-1: 减分隔线), 柱从底生长, 底部绿顶部红
+                    cavaSpectrumViz(6, termW / 2 - 1) | size(HEIGHT, EQUAL, 6),
+                }) | flex,
+                separator(),
+                info_render | size(WIDTH, EQUAL, termW / 2),
+            }) | flex,
+            separator(),
+            controls->Render() | center,
+            separator(),
+            hbox({
+                text(" 状态: ") | dim,
+                text(state_str) | color(state_color),
+                text("   " + trackInfo) | dim,
+                // 睡眠定时器状态
                 [&]() -> Element {
                     if (!g_sleepMsg.empty() && nowMs() < g_sleepMsgMs) {
                         return text(" " + g_sleepMsg + " ") | color(Color::Yellow);
@@ -2010,38 +2100,9 @@ void termus_ui_start(termus_cb_play cb_play, termus_cb_void cb_toggle,
                     }
                     return text("");
                 }(),
-            }),
-            separator(),
-            // 两列布局(同 C++ 版): 左列=列表+歌词(flex), 右列=信息(固定 2/5 宽)
-            hbox({
-                vbox({
-                    list_render | flex,
-                    separator(),
-                    // 歌词块(左列下方, 强制显示)
-                    vbox({
-                        hbox({
-                            text(" 歌词[" + std::string(lrcSourceName(lrcSource)) + "] ") | bold | dim,
-                            text(lrcSource == 1 ? lrcFile : "(内嵌/自动)") | dim | flex_grow,
-                        }),
-                        lrcRender(lrc, pos, lrcAlignSel) | flex,
-                    }),
-                }) | flex,
-                separator(),
-                // 右栏 = 终端宽 * 2/5 (动态)
-                info_render | size(WIDTH, EQUAL, termW * 2 / 5),
-            }) | flex,
-            separator(),
-            controls->Render() | center,
-            separator(),
-            hbox({
-                text(" 状态: ") | dim,
-                text(state_str) | color(state_color),
-                text("   " + trackInfo) | dim,
                 text("   " + dirInfo) | dim | flex_grow,
             }),
-            hbox({
-                text(" 回车=播放  空格=播放/暂停  ←/→=±5秒  +/-=音量  M=音乐库  R=刷新  S=设置  H=历史  /=搜索  ?=帮助  F4=歌单  A=加入歌单  Tab=队列  T=睡眠  i=详情  Q=退出") | dim,
-            }),
+            // 快捷键提示已移除(按 ? 查看帮助弹窗), 为封面/频谱让出空间
         });
 
         // 播放历史弹窗(H 键, 原版样式): 居中覆盖
